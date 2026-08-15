@@ -45,13 +45,16 @@ cargo run --example burnaddr
 1. Opening the page creates an Arkade wallet and stores its key in browser
    storage. Returning to Mutinynet restores that wallet and dot.
 2. Fund the displayed wallet with at least 660 sats over Arkade.
-3. One transaction sends 330 sats to the registry and creates a 330-sat player
-   carrier holding 50 W, 50 A, 50 S, and 50 D assets.
-4. Each keypress protocol-burns one unit of the matching asset and recreates
+3. Once the wallet is funded, click **Enter game**. The app creates one
+   registration transaction with a 330-sat registry marker and a 330-sat
+   player carrier holding 50 W, 50 A, 50 S, and 50 D assets.
+4. Never manually send funds to the registry address. Only fund the player
+   address displayed by the app.
+5. Each keypress protocol-burns one unit of the matching asset and recreates
    the same 330-sat carrier on the player's script.
-5. Every client reads the registry, batches queries for all registered player
+6. Every client reads the registry, batches queries for all registered player
    scripts, validates their burns, and replays the maze.
-6. Reaching the right-side exit records one lap and returns the dot to the
+7. Reaching the right-side exit records one lap and returns the dot to the
    entrance. The shared board never ends.
 
 The 660-sat minimum is one 330-sat registration plus one reusable 330-sat

@@ -10,22 +10,69 @@
 <body>
   <header>
     <h1>Arkade City <small id="version"></small></h1>
-    <strong id="phase">LOADING WASM</strong>
+    <span><b>Mutinynet</b> · <span id="phase">LOADING</span></span>
   </header>
-
-  <section class="bar" aria-label="Arkade connection">
-    <strong>Mutinynet</strong>
-    <code class="grow">https://mutinynet.arkade.sh</code>
-    <button id="connect">Reconnect</button>
-    <span id="boot-stage">loading</span>
-  </section>
 
   <p id="boot-error" class="error hidden"></p>
 
   <main id="app" class="hidden">
-    <div class="columns">
-      <section>
-        <h2>Wallet</h2>
+    <section id="entry-panel" class="entry">
+      <p class="eyebrow">Step 1 · Fund your player</p>
+      <h2>Send at least <span id="required-funding">660</span> sats to this address</h2>
+      <div class="address-row">
+        <code id="wallet-address">-</code>
+        <button id="copy-wallet">Copy</button>
+      </div>
+      <p id="funding-note">Checking wallet balance…</p>
+      <p class="help">Use <a href="https://faucet.mutinynet.com" target="_blank" rel="noreferrer">Mutinynet Faucet → Send to Arkade</a>. Do not use the on-chain address field.</p>
+      <button id="enter-game" class="primary" disabled>Enter game</button>
+      <p class="fine-print">Only fund your player address above. Enter Game creates the registration transaction for you; never manually send to the registry address.</p>
+    </section>
+
+    <section class="game-panel">
+      <div class="game-title">
+        <div>
+          <p class="eyebrow">Shared world</p>
+          <h2>City grid</h2>
+        </div>
+        <div class="game-stats"><span><b id="player-count">0</b> players</span><span><b id="event-count">0</b> moves</span></div>
+      </div>
+
+      <div class="assets" aria-label="Move asset balances">
+        <span>W <b id="asset-w">0</b></span>
+        <span>A <b id="asset-a">0</b></span>
+        <span>S <b id="asset-s">0</b></span>
+        <span>D <b id="asset-d">0</b></span>
+      </div>
+
+      <div class="game-head">
+        <strong id="board-status">waiting</strong>
+        <span><span id="queue-count">0</span> queued</span>
+      </div>
+      <canvas id="canvas" width="520" height="520" aria-label="Shared Arkade city grid"></canvas>
+      <div class="controls" aria-label="Movement controls">
+        <button data-dir="0">W</button>
+        <button data-dir="3">A</button>
+        <button data-dir="2">S</button>
+        <button data-dir="1">D</button>
+      </div>
+    </section>
+
+    <details class="drawer">
+      <summary>How entering the game works</summary>
+      <p>After you click Enter Game, Arkade City uses 330 sats to publish a registration marker and keeps another 330 sats in your player wallet as the reusable move-asset carrier.</p>
+      <p>You only send funds to your own player address. The app handles the shared registry output inside the registration transaction. Moves do not pay the registry.</p>
+    </details>
+
+    <details class="drawer">
+      <summary>Wallet &amp; recovery <span id="wallet-summary">0 sats</span></summary>
+      <div class="wallet-grid">
+        <div>
+          <h3>Wallet status</h3>
+          <div class="address-row compact">
+            <code id="wallet-address-detail">-</code>
+            <button id="copy-wallet-detail">Copy</button>
+          </div>
         <dl>
           <dt>Network</dt><dd id="network">-</dd>
           <dt>Operator</dt><dd><code id="operator">-</code></dd>
@@ -33,25 +80,21 @@
           <dt>Spendable</dt><dd id="balance">0 sats</dd>
           <dt>Known total</dt><dd id="known-balance">0 sats</dd>
           <dt>Pending tx</dt><dd><code id="pending-tx">none</code></dd>
+          <dt>Player ID</dt><dd><code id="player-id">not registered</code></dd>
+          <dt>Game sync</dt><dd id="sync">never</dd>
+          <dt>Wallet sync</dt><dd id="wallet-sync">never</dd>
         </dl>
-
-        <label>Receive address</label>
-        <div class="copy-row">
-          <code id="wallet-address">-</code>
-          <button id="copy-wallet">Copy</button>
-        </div>
-        <p id="funding-note" class="notice"></p>
-        <p id="faucet-note" class="notice hidden"></p>
-
-        <h3>Send everything</h3>
-        <p class="small">Sweeps every safely spendable sat and asset. Move assets will no longer be playable after sending them to another wallet.</p>
-        <div class="action-row">
-          <input id="sweep-address" class="grow" placeholder="destination ark1... or tark1..." spellcheck="false">
-          <button id="sweep-all">Sweep all</button>
+          <button id="connect">Reconnect operator</button>
+          <h3>Send everything</h3>
+          <p class="help">Moves stop working here after assets are sent elsewhere.</p>
+          <div class="action-row">
+            <input id="sweep-address" placeholder="destination tark1..." spellcheck="false">
+            <button id="sweep-all">Sweep all</button>
+          </div>
         </div>
 
-        <details open>
-          <summary>Recovery and key import</summary>
+        <div>
+          <h3>Recovery</h3>
           <label>Current recovery bundle</label>
           <textarea id="recovery-key" readonly></textarea>
           <button id="copy-recovery">Copy recovery</button>
@@ -61,57 +104,24 @@
             <button id="import-wallet">Import and reload</button>
             <button id="forget-wallet" class="danger">Forget wallet</button>
           </div>
-        </details>
-      </section>
-
-      <section>
-        <h2>Game protocol</h2>
-        <dl>
-          <dt>Registry</dt><dd><code id="game-address">-</code></dd>
-          <dt>Player ID</dt><dd><code id="player-id">not registered</code></dd>
-          <dt>Players</dt><dd id="player-count">0</dd>
-          <dt>Accepted moves</dt><dd id="event-count">0</dd>
-          <dt>Game sync</dt><dd id="sync">never</dd>
-          <dt>Wallet sync</dt><dd id="wallet-sync">never</dd>
-        </dl>
-
-        <div class="assets" aria-label="Move asset balances">
-          <span>W <b id="asset-w">0</b></span>
-          <span>A <b id="asset-a">0</b></span>
-          <span>S <b id="asset-s">0</b></span>
-          <span>D <b id="asset-d">0</b></span>
         </div>
+      </div>
+    </details>
 
-        <div class="game-head">
-          <strong id="board-status">waiting</strong>
-          <span><span id="queue-count">0</span> queued</span>
-        </div>
-        <canvas id="canvas" width="520" height="520" aria-label="Shared Arkade maze"></canvas>
-        <div class="controls" aria-label="Movement controls">
-          <button data-dir="0">W</button>
-          <button data-dir="3">A</button>
-          <button data-dir="2">S</button>
-          <button data-dir="1">D</button>
-        </div>
-      </section>
-    </div>
-
-    <section>
-      <h2>Wallet VTXOs</h2>
+    <details class="drawer">
+      <summary>Technical details</summary>
+      <h3>Wallet VTXOs</h3>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Outpoint</th><th>Sats</th><th>Status</th><th>Expires</th><th>Assets</th><th>Spent by</th></tr></thead>
           <tbody id="vtxos"><tr><td colspan="6">none</td></tr></tbody>
         </table>
       </div>
-    </section>
-
-    <section>
-      <h2>Last error</h2>
+      <h3>Last error</h3>
       <pre id="last-error">none</pre>
-      <h2>Activity log</h2>
+      <h3>Activity log</h3>
       <pre id="log">waiting for first state</pre>
-    </section>
+    </details>
   </main>
 
   <script type="module" src="web.js"></script>

@@ -1,4 +1,4 @@
-import init, { App } from './pkg/arkade_city.js?v=2.0.0';
+import init, { App } from './pkg/arkade_city.js?v=2.1.0';
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -8,6 +8,7 @@ const SERVER = 'https://mutinynet.arkade.sh';
 let app = null;
 let snapshot = null;
 let inputQueue = [];
+let pendingEnterGame = false;
 let pendingSweep = null;
 let driverGeneration = 0;
 let currentServer = '';
@@ -87,7 +88,6 @@ async function connectApp() {
   hide('app');
   hide('boot-error');
   text('phase', 'CONNECTING');
-  text('boot-stage', 'reading /v1/info');
 
   const server = SERVER;
   currentServer = server;
@@ -107,11 +107,10 @@ async function connectApp() {
   app = instance;
   persistAppPending(instance);
   text('wallet-address', instance.address());
-  text('game-address', instance.gameAddress());
+  text('wallet-address-detail', instance.address());
   text('recovery-key', instance.exportRecovery());
   snapshot = instance.snapshot();
   applySnapshot(snapshot);
-  text('boot-stage', storedKey ? 'restored wallet; starting sync' : 'persisted wallet; starting sync');
   show('app');
   bindWalletAddressActions();
   driver(instance, generation);
@@ -119,6 +118,7 @@ async function connectApp() {
 
 function bindWalletAddressActions() {
   $('copy-wallet').onclick = () => copy(app.address(), $('copy-wallet'));
+  $('copy-wallet-detail').onclick = () => copy(app.address(), $('copy-wallet-detail'));
   $('copy-recovery').onclick = () => copy(app.exportRecovery(), $('copy-recovery'));
 }
 
@@ -134,9 +134,15 @@ function parseImportedSecret(raw) {
 function bindStaticActions() {
   $('connect').addEventListener('click', () => connectApp().catch((error) => {
     text('phase', 'CONNECT FAILED');
-    text('boot-stage', 'not connected');
     showError(String(error));
   }));
+
+  $('enter-game').addEventListener('click', () => {
+    if (!snapshot?.fundingReady || snapshot.pending || snapshot.sending) return;
+    pendingEnterGame = true;
+    $('enter-game').disabled = true;
+    $('enter-game').textContent = 'Entering…';
+  });
 
   $('import-wallet').addEventListener('click', () => {
     try {
@@ -204,32 +210,29 @@ function updateQueueCount() {
 }
 
 async function driver(instance, generation) {
-  let firstSync = true;
   while (app === instance && generation === driverGeneration) {
     const directions = inputQueue;
+    const enterGame = pendingEnterGame;
     const sweep = pendingSweep;
     inputQueue = [];
+    pendingEnterGame = false;
     pendingSweep = null;
     updateQueueCount();
     try {
-      if (firstSync) text('boot-stage', 'syncing wallet and game');
       const nextSnapshot = await withTimeout(
-        instance.step(new Uint8Array(directions), sweep || undefined),
+        instance.step(new Uint8Array(directions), enterGame, sweep || undefined),
         70_000,
         'State sync',
       );
       try {
         persistAppPending(instance);
       } catch (error) {
-        text('boot-stage', 'wallet persistence failed; transaction halted');
         showError(`Transaction journal failed: ${String(error)}`);
         return;
       }
       snapshot = nextSnapshot;
       applySnapshot(snapshot);
       hide('boot-error');
-      text('boot-stage', 'connected');
-      firstSync = false;
     } catch (error) {
       console.error('game step failed', error);
       showError(`State sync failed: ${String(error)}`);
@@ -250,7 +253,7 @@ function applySnapshot(state) {
   text('network', state.network);
   text('operator', `${state.server} | ${state.operatorVersion} | ${state.signer}`);
   text('wallet-address', state.address);
-  text('game-address', state.gameAddress);
+  text('wallet-address-detail', state.address);
   text('wallet-action', state.walletAction);
   text('balance', `${state.balance.toLocaleString()} sats`);
   text('known-balance', `${state.knownBalance.toLocaleString()} sats`);
@@ -262,6 +265,8 @@ function applySnapshot(state) {
   text('wallet-sync', age(state.walletSyncMs));
   text('last-error', state.lastError || 'none');
   text('log', (state.log || []).join('\n'));
+  text('required-funding', state.requiredFunding.toLocaleString());
+  text('wallet-summary', `${state.balance.toLocaleString()} sats`);
 
   const balances = state.moveBalances || [0, 0, 0, 0];
   text('asset-w', balances[0]);
@@ -273,22 +278,21 @@ function applySnapshot(state) {
   if (state.phase === 'fund-wallet') {
     const missing = Math.max(0, state.requiredFunding - state.balance);
     text('funding-note', state.fundingReady
-      ? 'Funding inputs are ready. Registration will run automatically.'
-      : `Fund this address. Minimum ${state.requiredFunding} sats; currently missing at least ${missing} sats.`);
+      ? `Funded with ${state.balance.toLocaleString()} sats. Click Enter game when you are ready.`
+      : `Balance: ${state.balance.toLocaleString()} sats. Send at least ${missing.toLocaleString()} more sats to the player address above.`);
   } else if (state.phase === 'issuing') {
-    text('funding-note', 'Registration submitted or waiting for its indexed asset carrier.');
+    text('funding-note', 'Entering the game: creating and indexing your registration.');
   } else if (state.phase === 'syncing') {
-    text('funding-note', 'Wallet assets found. Full player history is being verified.');
+    text('funding-note', 'Registration found. Verifying the shared game history.');
   } else {
-    text('funding-note', 'Wallet is ready. Each move burns one asset and recycles the carrier sats.');
+    text('funding-note', 'You are in the game.');
   }
 
-  if (state.network === 'mutinynet') {
-    text('faucet-note', `Use "Send to Arkade" at https://faucet.mutinynet.com for ${state.address}; do not use its on-chain address field.`);
-    show('faucet-note');
-  } else {
-    hide('faucet-note');
-  }
+  const entering = state.phase === 'issuing' || state.phase === 'syncing';
+  const showEntry = state.phase === 'fund-wallet' || entering;
+  showEntry ? show('entry-panel') : hide('entry-panel');
+  $('enter-game').disabled = state.phase !== 'fund-wallet' || !state.fundingReady || state.pending || state.sending || pendingEnterGame;
+  $('enter-game').textContent = entering || pendingEnterGame ? 'Entering…' : 'Enter game';
 
   const controlsEnabled = state.phase === 'playing' && !state.sending && !state.pending;
   for (const button of document.querySelectorAll('[data-dir]')) {
@@ -373,13 +377,11 @@ function drawGame(context, width, height, state) {
 async function boot() {
   bindStaticActions();
   requestAnimationFrame(render);
-  text('boot-stage', 'loading WASM');
   await withTimeout(init(), 20_000, 'WASM initialization');
   await connectApp();
 }
 
 boot().catch((error) => {
   text('phase', 'BOOT FAILED');
-  text('boot-stage', 'not connected');
   showError(`Could not start Arkade City: ${String(error)}`);
 });

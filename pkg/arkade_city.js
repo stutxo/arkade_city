@@ -154,18 +154,18 @@ export class App {
         }
     }
     /**
-     * Queue direction presses (0=up, 1=right, 2=down, 3=left), synchronize
-     * wallet/game state, and execute at most one sweep or move asset burn.
+     * Synchronize state and execute at most one requested wallet/game action.
      * @param {Uint8Array} dirs
+     * @param {boolean} enter_game
      * @param {string | null} [sweep_address]
      * @returns {Promise<any>}
      */
-    step(dirs, sweep_address) {
+    step(dirs, enter_game, sweep_address) {
         const ptr0 = passArray8ToWasm0(dirs, wasm.__wbindgen_export);
         const len0 = WASM_VECTOR_LEN;
         var ptr1 = isLikeNone(sweep_address) ? 0 : passStringToWasm0(sweep_address, wasm.__wbindgen_export, wasm.__wbindgen_export2);
         var len1 = WASM_VECTOR_LEN;
-        const ret = wasm.app_step(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        const ret = wasm.app_step(this.__wbg_ptr, ptr0, len0, enter_game, ptr1, len1);
         return takeObject(ret);
     }
 }

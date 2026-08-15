@@ -67,7 +67,7 @@ async fn play(keys: Keys, rest: ArkadeRest, params: ServerParams) -> Result<()> 
         } else {
             Vec::new()
         };
-        app.step(&direction, None).await;
+        app.step(&direction, true, None).await;
 
         let snapshot = app.snapshot("bot");
         if tick % 10 == 0 {

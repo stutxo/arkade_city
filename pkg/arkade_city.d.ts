@@ -26,10 +26,9 @@ export class App {
      */
     snapshot(): any;
     /**
-     * Queue direction presses (0=up, 1=right, 2=down, 3=left), synchronize
-     * wallet/game state, and execute at most one sweep or move asset burn.
+     * Synchronize state and execute at most one requested wallet/game action.
      */
-    step(dirs: Uint8Array, sweep_address?: string | null): Promise<any>;
+    step(dirs: Uint8Array, enter_game: boolean, sweep_address?: string | null): Promise<any>;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -44,7 +43,7 @@ export interface InitOutput {
     readonly app_gameAddress: (a: number, b: number) => void;
     readonly app_init: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly app_snapshot: (a: number, b: number) => void;
-    readonly app_step: (a: number, b: number, c: number, d: number, e: number) => number;
+    readonly app_step: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly rustsecp256k1_v0_12_context_create: (a: number) => number;
     readonly rustsecp256k1_v0_12_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_12_default_error_callback_fn: (a: number, b: number) => void;

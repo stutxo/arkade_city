@@ -47,8 +47,8 @@ verified in storage before any transaction can be submitted. The raw key,
 operator contract parameters, and pending journal are available in the
 recovery bundle.
 
-Once the wallet has a valid BTC-only input set, it creates one combined
-registration and issuance transaction:
+Once the wallet has a valid BTC-only input set and the player explicitly clicks
+Enter Game, it creates one combined registration and issuance transaction:
 
 ```text
 input(s): BTC-only VTXOs totaling at least two times operator dust

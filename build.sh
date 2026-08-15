@@ -29,9 +29,9 @@ fi
 
 echo "using CC_wasm32_unknown_unknown=$CC_wasm32_unknown_unknown"
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
-wasm-pack build --target web --release
-cp pkg/README.md README.md
+wasm-pack build --target web --release --no-pack
+cp README.md pkg/README.md
 rm -f pkg/.gitignore
-node --input-type=module -e 'import fs from "node:fs"; const path = "pkg/package.json"; const pkg = JSON.parse(fs.readFileSync(path, "utf8")); pkg.private = true; fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);'
+node --input-type=module -e 'import fs from "node:fs"; const files = fs.readdirSync("pkg"); const main = files.find((file) => file.endsWith(".js") && !file.endsWith("_bg.js")); if (!main) throw new Error("generated JS entry point missing"); const stem = main.slice(0, -3); const pkg = { name: stem.replaceAll("_", "-"), type: "module", version: "0.1.0", license: "MIT", files: [`${stem}_bg.wasm`, main, `${stem}.d.ts`], main, types: `${stem}.d.ts`, sideEffects: ["./snippets/*"], private: true }; fs.writeFileSync("pkg/package.json", `${JSON.stringify(pkg, null, 2)}\n`);'
 
 echo "built Arkade City: pkg/arkade_city.js + pkg/arkade_city_bg.wasm"

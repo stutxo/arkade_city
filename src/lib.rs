@@ -13,7 +13,7 @@ pub use keys::Keys;
 use match_::GameApp;
 use wasm_bindgen::prelude::*;
 
-pub const VERSION: &str = "2.0.0";
+pub const VERSION: &str = "2.1.0";
 pub const MUTINYNET_SERVER: &str = "https://mutinynet.arkade.sh";
 
 fn js_err(error: anyhow::Error) -> JsValue {
@@ -114,15 +114,17 @@ impl App {
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Queue direction presses (0=up, 1=right, 2=down, 3=left), synchronize
-    /// wallet/game state, and execute at most one sweep or move asset burn.
+    /// Synchronize state and execute at most one requested wallet/game action.
     #[wasm_bindgen(js_name = step)]
     pub async fn step(
         &mut self,
         dirs: Vec<u8>,
+        enter_game: bool,
         sweep_address: Option<String>,
     ) -> Result<JsValue, JsValue> {
-        self.inner.step(&dirs, sweep_address.as_deref()).await;
+        self.inner
+            .step(&dirs, enter_game, sweep_address.as_deref())
+            .await;
         self.snapshot()
     }
 }

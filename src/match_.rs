@@ -316,7 +316,7 @@ impl GameApp {
 
     /// Serialized browser tick: refresh wallet state, recover pending wallet
     /// actions, then synchronize game history before executing a move.
-    pub async fn step(&mut self, dirs: &[u8], sweep_address: Option<&str>) {
+    pub async fn step(&mut self, dirs: &[u8], enter_game: bool, sweep_address: Option<&str>) {
         self.queue_inputs(dirs);
 
         let player_script = self.player_script();
@@ -381,7 +381,7 @@ impl GameApp {
         }
 
         if self.move_assets.is_none() {
-            if self.funding_ready && !self.sending {
+            if enter_game && self.funding_ready && !self.sending {
                 if let Err(err) = self.issue_move_assets(&spendable).await {
                     self.handle_send_error("issuance", &err);
                 }
