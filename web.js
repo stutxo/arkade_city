@@ -26,8 +26,30 @@ function hide(id) { $id(id).classList.add('hidden'); }
 function setText(id, text) { $id(id).textContent = text; }
 
 async function boot() {
-  await init();
-  app = await App.init(serverUrl);
+  // Show the lobby immediately: it only depends on the URL fragment, and
+  // init can take a few seconds (wasm download + GetInfo).
+  if (fragmentAddr.startsWith('tark1') || fragmentAddr.startsWith('ark1')) {
+    show('join-row');
+    setText('join-addr', fragmentAddr);
+  }
+  setText('phase', 'booting…');
+
+  // wasm load + GetInfo can be flaky on first hit; retry with backoff.
+  let lastErr = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await init();
+      app = await App.init(serverUrl);
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      console.warn('boot attempt', attempt, e);
+      setText('phase', `booting… (attempt ${attempt + 2})`);
+      await sleep(800 * (attempt + 1));
+    }
+  }
+  if (lastErr) throw lastErr;
   applyNetwork(app.network());
 
   $('net-btn').onclick = () => {
@@ -39,11 +61,6 @@ async function boot() {
   setText('address', app.address());
   setText('recovery-key', app.exportKey());
   $('copy-addr').onclick = () => navigator.clipboard.writeText(app.address());
-
-  if (fragmentAddr.startsWith('tark1') || fragmentAddr.startsWith('ark1')) {
-    show('join-row');
-    setText('join-addr', fragmentAddr);
-  }
 
   $('host-btn').onclick = () => {
     command = 'host';
@@ -211,5 +228,6 @@ function drawStick(ctx, x, y, color) {
 }
 
 boot().catch((e) => {
-  document.body.innerHTML = `<pre class="warn">boot failed: ${e}</pre>`;
+  setText('phase', 'boot failed — reload to retry');
+  addLogLine(`boot failed: ${e}`);
 });

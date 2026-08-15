@@ -512,24 +512,43 @@ impl MatchApp {
         for s in scripts {
             records.extend(self.rest.get_vtxos(s, "").await?);
         }
-        // New creating txids = candidate event txs.
+        // New creating txids = candidate event txs. The indexer's arkTxid
+        // field is empty for some records (fresh preconfirmed outputs), so
+        // fall back to the outpoint txid: for offchain-created VTXOs that IS
+        // the creating virtual tx. Batch/boarding records may resolve to
+        // non-virtual txids; those simply fail to fetch and are skipped.
         let mut new_txids: Vec<String> = Vec::new();
         for r in &records {
-            // arkTxid is empty for records that were not created by a virtual
-            // tx (e.g. boarded/settled outputs) — skip those.
-            let Some(txid) = r.ark_txid.as_deref().filter(|t| t.len() == 64) else {
-                continue;
-            };
-            let Ok(parsed) = txid.parse::<Txid>() else { continue };
+            let candidate = r
+                .ark_txid
+                .as_deref()
+                .filter(|t| t.len() == 64)
+                .map(str::to_string)
+                .unwrap_or_else(|| r.outpoint.txid.to_string());
+            let Ok(parsed) = candidate.parse::<Txid>() else { continue };
             if !self.seen_txs.contains(&parsed) {
                 self.seen_txs.insert(parsed);
-                new_txids.push(txid.to_string());
+                new_txids.push(candidate);
             }
         }
         if new_txids.is_empty() {
             return Ok(());
         }
-        let txs = self.rest.get_virtual_txs(&new_txids).await?;
+        // Fetch in one batch; if any txid isn't a virtual tx (e.g. a batch
+        // commitment from the outpoint fallback), retry one-by-one so a
+        // single bad id doesn't hide real events.
+        let txs = match self.rest.get_virtual_txs(&new_txids).await {
+            Ok(txs) => txs,
+            Err(_) => {
+                let mut acc = Vec::new();
+                for id in &new_txids {
+                    if let Ok(mut txs) = self.rest.get_virtual_txs(&[id.clone()]).await {
+                        acc.append(&mut txs);
+                    }
+                }
+                acc
+            }
+        };
         let my_pk = self.keys.owner_pk();
         let my_pk_bytes = my_pk.serialize();
         for psbt in &txs {
