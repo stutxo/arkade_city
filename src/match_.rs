@@ -1347,6 +1347,14 @@ impl GameApp {
         })
     }
 
+    fn pending_direction(&self) -> Option<u8> {
+        match self.pending_action.as_ref() {
+            Some(PendingAction::Move { direction, .. })
+            | Some(PendingAction::UnknownMove { direction, .. }) => Some(*direction),
+            _ => None,
+        }
+    }
+
     fn wallet_action(&self) -> &'static str {
         match self.pending_action {
             Some(PendingAction::Sweep { .. }) => "finalizing-sweep",
@@ -1443,6 +1451,8 @@ impl GameApp {
             wallet_action: self.wallet_action().to_string(),
             wallet_vtxos: self.wallet_snapshots(),
             queued: self.pending_dirs.len() as u32,
+            queued_directions: self.pending_dirs.iter().copied().collect(),
+            pending_direction: self.pending_direction(),
             players: self.player_snapshots(),
             maze_width: crate::game::MAZE_W,
             maze_height: crate::game::MAZE_H,
@@ -1512,6 +1522,8 @@ pub struct Snapshot {
     pub wallet_action: String,
     pub wallet_vtxos: Vec<WalletVtxoSnapshot>,
     pub queued: u32,
+    pub queued_directions: Vec<u8>,
+    pub pending_direction: Option<u8>,
     pub players: Vec<PlayerSnapshot>,
     pub maze_width: i32,
     pub maze_height: i32,

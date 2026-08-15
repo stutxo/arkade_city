@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#ffffff">
   <title>Arkade City</title>
-  <link rel="stylesheet" href="game.css?v=2.2.0">
+  <link rel="stylesheet" href="game.css?v=2.3.0">
 </head>
 <body>
   <header>
@@ -38,20 +38,14 @@
         <div class="game-stats"><span><b id="player-count">0</b> players</span><span><b id="event-count">0</b> moves</span></div>
       </div>
 
-      <div class="assets" aria-label="Move asset balances">
-        <span>W <b id="asset-w">0</b></span>
-        <span>A <b id="asset-a">0</b></span>
-        <span>S <b id="asset-s">0</b></span>
-        <span>D <b id="asset-d">0</b></span>
-      </div>
-
       <div id="queue-status" class="queue-status">No moves queued</div>
+      <div id="projection-status" class="projection-status hidden"></div>
       <canvas id="canvas" width="520" height="520" aria-label="Shared Arkade city grid"></canvas>
       <div class="controls" aria-label="Movement controls">
-        <button data-dir="0">W</button>
-        <button data-dir="3">A</button>
-        <button data-dir="2">S</button>
-        <button data-dir="1">D</button>
+        <button data-dir="0"><strong>W</strong><small>$W · <b id="asset-w">0</b></small></button>
+        <button data-dir="3"><strong>A</strong><small>$A · <b id="asset-a">0</b></small></button>
+        <button data-dir="2"><strong>S</strong><small>$S · <b id="asset-s">0</b></small></button>
+        <button data-dir="1"><strong>D</strong><small>$D · <b id="asset-d">0</b></small></button>
       </div>
     </section>
 
@@ -121,6 +115,6 @@
     </details>
   </main>
 
-  <script type="module" src="web.js?v=2.2.0"></script>
+  <script type="module" src="web.js?v=2.3.0"></script>
 </body>
 </html>

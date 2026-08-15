@@ -1,4 +1,4 @@
-import init, { App } from './pkg/arkade_city.js?v=2.2.0';
+import init, { App } from './pkg/arkade_city.js?v=2.3.0';
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -14,6 +14,7 @@ let driverGeneration = 0;
 let currentServer = '';
 let driverWakePending = false;
 let driverWakeResolve = null;
+let inFlightDirections = [];
 
 function text(id, value) {
   $(id).textContent = String(value ?? '');
@@ -220,6 +221,7 @@ function updateQueueCount() {
       : 'No moves queued';
   text('queue-status', status);
   $('queue-status').classList.toggle('active', submitting || queued > 0);
+  updateProjectionStatus();
 }
 
 function wakeDriver() {
@@ -251,6 +253,8 @@ async function driver(instance, generation) {
     const enterGame = pendingEnterGame;
     const sweep = pendingSweep;
     if (canSendMoves) inputQueue = [];
+    inFlightDirections = directions;
+    updateProjectionStatus();
     pendingEnterGame = false;
     pendingSweep = null;
     try {
@@ -266,6 +270,7 @@ async function driver(instance, generation) {
         return;
       }
       snapshot = nextSnapshot;
+      inFlightDirections = [];
       applySnapshot(snapshot);
       hide('boot-error');
     } catch (error) {
@@ -372,6 +377,45 @@ function playerColor(id) {
   return `hsl(${hue} 70% 60%)`;
 }
 
+function projectedPlayer(state) {
+  const player = state.players.find((candidate) => candidate.isMe);
+  if (!player) return null;
+  const directions = [
+    ...(state.pendingDirection === undefined || state.pendingDirection === null ? [] : [state.pendingDirection]),
+    ...(state.queuedDirections || []),
+    ...inFlightDirections,
+    ...inputQueue,
+  ];
+  if (!directions.length) return null;
+
+  const walls = new Set(state.walls.map(([x, y]) => `${x},${y}`));
+  let x = player.x;
+  let y = player.y;
+  let laps = player.laps;
+  for (const direction of directions) {
+    const [dx, dy] = [[0, -1], [1, 0], [0, 1], [-1, 0]][direction] || [0, 0];
+    const nextX = x + dx;
+    const nextY = y + dy;
+    if (!walls.has(`${nextX},${nextY}`)) [x, y] = [nextX, nextY];
+    if (x === state.goal[0] && y === state.goal[1]) {
+      [x, y] = state.start;
+      laps += 1;
+    }
+  }
+  return { x, y, laps, moves: directions.length, currentLaps: player.laps };
+}
+
+function updateProjectionStatus() {
+  const projected = snapshot && projectedPlayer(snapshot);
+  if (!projected) {
+    hide('projection-status');
+    return;
+  }
+  const lap = projected.laps > projected.currentLaps ? ' · lap completed' : '';
+  text('projection-status', `Projected landing: ${projected.x}, ${projected.y} after ${projected.moves} unsettled move${projected.moves === 1 ? '' : 's'}${lap}`);
+  show('projection-status');
+}
+
 function render() {
   const canvas = $('canvas');
   const rect = canvas.getBoundingClientRect();
@@ -409,6 +453,16 @@ function drawGame(context, width, height, state) {
       context.lineWidth = Math.max(1, cell * 0.08);
       context.stroke();
     }
+  }
+  const projected = projectedPlayer(state);
+  if (projected) {
+    context.beginPath();
+    context.arc(ox + (projected.x + 0.5) * cell, oy + (projected.y + 0.5) * cell, Math.max(5, cell * 0.34), 0, Math.PI * 2);
+    context.strokeStyle = '#fff';
+    context.lineWidth = Math.max(2, cell * 0.08);
+    context.setLineDash([Math.max(2, cell * 0.12), Math.max(2, cell * 0.12)]);
+    context.stroke();
+    context.setLineDash([]);
   }
 }
 
