@@ -13,7 +13,7 @@ pub use keys::Keys;
 use match_::GameApp;
 use wasm_bindgen::prelude::*;
 
-pub const VERSION: &str = "2.3.0";
+pub const VERSION: &str = "2.3.1";
 pub const MUTINYNET_SERVER: &str = "https://mutinynet.arkade.sh";
 
 fn js_err(error: anyhow::Error) -> JsValue {

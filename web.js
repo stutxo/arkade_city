@@ -1,4 +1,5 @@
-import init, { App } from './pkg/arkade_city.js?v=2.3.0';
+import init, { App } from './pkg/arkade_city.js?v=2.3.1';
+const wasmUrl = './pkg/arkade_city_bg.wasm?v=2.3.1';
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -469,7 +470,7 @@ function drawGame(context, width, height, state) {
 async function boot() {
   bindStaticActions();
   requestAnimationFrame(render);
-  await withTimeout(init(), 20_000, 'WASM initialization');
+  await withTimeout(init({ module_or_path: new URL(wasmUrl, import.meta.url) }), 20_000, 'WASM initialization');
   await connectApp();
 }
 
