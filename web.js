@@ -1,4 +1,4 @@
-import init, { App, keyMask } from './pkg/arkade_duel.js?v=0.2.3';
+import init, { App, keyMask } from './pkg/arkade_duel.js?v=0.2.4';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -28,6 +28,12 @@ function setText(id, text) { $id(id).textContent = text; }
 async function boot() {
   await init();
   app = await App.init(serverUrl);
+  applyNetwork(app.network());
+
+  $('net-btn').onclick = () => {
+    // Drop the fragment: invite links are network-specific.
+    location.href = location.pathname + (onMainnet ? '?server=https://mutinynet.arkade.sh' : '');
+  };
 
   setText('address', app.address());
   setText('recovery-key', app.exportKey());
@@ -50,6 +56,8 @@ async function boot() {
     command = 'join';
     commandArg = fragmentAddr;
     $('join-btn').disabled = true;
+    $('join-btn').textContent = 'SENDING START…';
+    addLogLine('building and sending START tx…');
   };
 
   $('reset-btn').onclick = () => {
@@ -77,6 +85,12 @@ async function driver() {
       applySnapshot(lastSnapshot);
     } catch (e) {
       console.warn('step failed', e);
+      addLogLine(`step error: ${e}`);
+      if ($('join-btn').disabled && command === '') {
+        // a failed join leaves the command consumed; let the user retry
+        $('join-btn').disabled = false;
+        $('join-btn').textContent = 'ACCEPT & SEND START TX';
+      }
     }
     await sleep(1400);
   }
@@ -84,6 +98,13 @@ async function driver() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function addLogLine(text) {
+  const ul = $('log');
+  const li = document.createElement('li');
+  li.textContent = text;
+  ul.prepend(li);
 }
 
 function applySnapshot(s) {
@@ -117,11 +138,11 @@ function applySnapshot(s) {
   }
 }
 
-let netApplied = false;
+let onMainnet = true;
+
 function applyNetwork(network) {
-  if (!network || netApplied) return;
-  netApplied = true;
   const mainnet = network === 'mainnet';
+  onMainnet = mainnet;
   const badge = $('net-badge');
   badge.textContent = mainnet ? 'MAINNET' : 'SIGNET (mutinynet)';
   badge.className = mainnet ? 'badge mainnet' : 'badge signet';
@@ -137,13 +158,6 @@ function applyNetwork(network) {
     }
   }
 }
-
-$('net-btn').onclick = () => {
-  const mainnet = ($('net-badge').textContent || '').includes('MAIN');
-  const q = mainnet ? '?server=https://mutinynet.arkade.sh' : '';
-  // Drop the fragment: invite links are network-specific.
-  location.href = location.pathname + q;
-};
 
 function bindKeys() {
   addEventListener('keydown', (e) => {

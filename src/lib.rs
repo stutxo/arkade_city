@@ -23,7 +23,7 @@ use wasm_bindgen::prelude::*;
 const STORAGE_KEY: &str = "arkade-duel:key";
 const STORAGE_STATE: &str = "arkade-duel:match";
 /// Bumped on every deploy; shown in the UI so stale caches are obvious.
-pub const VERSION: &str = "0.2.3";
+pub const VERSION: &str = "0.2.4";
 /// Public Arkade mainnet operator. Override with `?server=https://…`
 /// (e.g. https://mutinynet.arkade.sh for testing).
 const DEFAULT_SERVER: &str = "https://arkade.computer";
@@ -96,6 +96,15 @@ impl App {
     #[wasm_bindgen(js_name = address)]
     pub fn address(&self) -> String {
         self.inner.my_address().encode()
+    }
+
+    /// "mainnet" or "signet" — known right after init, before any snapshot.
+    #[wasm_bindgen(js_name = network)]
+    pub fn network(&self) -> String {
+        match self.inner.params.network {
+            bitcoin::Network::Bitcoin => "mainnet".to_string(),
+            _ => "signet".to_string(),
+        }
     }
 
     /// Recovery export: the raw key hex. Anyone holding it can spend.

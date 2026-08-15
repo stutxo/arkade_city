@@ -15,6 +15,10 @@ export class App {
      */
     static init(server_url?: string | null): Promise<App>;
     /**
+     * "mainnet" or "signet" — known right after init, before any snapshot.
+     */
+    network(): string;
+    /**
      * The single serialized entry point.
      *
      * * `command`: "", "host", "join" (`arg` = host address), or "reset"
@@ -36,6 +40,7 @@ export interface InitOutput {
     readonly app_address: (a: number, b: number) => void;
     readonly app_exportKey: (a: number, b: number) => void;
     readonly app_init: (a: number, b: number) => number;
+    readonly app_network: (a: number, b: number) => void;
     readonly app_step: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => number;
     readonly keyMask: (a: number, b: number, c: number, d: number) => number;
     readonly rustsecp256k1_v0_12_context_create: (a: number) => number;
@@ -46,8 +51,8 @@ export interface InitOutput {
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;
     readonly rustsecp256k1_v0_10_0_default_illegal_callback_fn: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_3420: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_3422: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_3423: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_3425: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;
