@@ -93,11 +93,20 @@ set (see `order_events`, property-tested in `gamelog::tests`).
 
 ### Determinism
 
-The sim (`game.rs`) uses integer math only. Movement is a WASD bitmask;
-facing derives from the last nonzero movement direction, so a FIRE event
-needs no aim data — the replay reconstructs position and facing at the fire
-tick. One hit wins. Late-arriving events trigger a full re-run from the
-start tick (cheap at match scale).
+The sim (`game.rs`) is fully event-sourced and integer-only — no wall clock
+anywhere. A move event steps 25px in its direction; facing derives from the
+last step, so FIRE needs no aim data. Bullets advance one 30px step per
+applied event with swept (segment) collision, so latency changes *when* a
+state appears, never *what* it is. One hit wins. Late events trigger a full
+re-run from event zero (cheap at match scale).
+
+### Per-match identities
+
+Every match runs on a fresh keypair (`host`/`join` generate one), so each
+game gets a clean VTXO script history — everything on the two game scripts
+belongs to the match. The game key is auto-funded from the master key with a
+plain 5000-sat offchain send; the master key is the persistent funding
+identity shown in the UI.
 
 ## Operator constraints (validated against arkd source + live GetInfo)
 
