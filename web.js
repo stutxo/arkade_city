@@ -87,7 +87,6 @@ async function connectApp() {
   snapshot = null;
   hide('app');
   hide('boot-error');
-  text('phase', 'CONNECTING');
 
   const server = SERVER;
   currentServer = server;
@@ -133,7 +132,6 @@ function parseImportedSecret(raw) {
 
 function bindStaticActions() {
   $('connect').addEventListener('click', () => connectApp().catch((error) => {
-    text('phase', 'CONNECT FAILED');
     showError(String(error));
   }));
 
@@ -249,7 +247,6 @@ function age(ms) {
 function applySnapshot(state) {
   if (app) text('recovery-key', app.exportRecovery());
   text('version', `v${state.version}`);
-  text('phase', state.phase.toUpperCase());
   text('network', state.network);
   text('operator', `${state.server} | ${state.operatorVersion} | ${state.signer}`);
   text('wallet-address', state.address);
@@ -381,6 +378,5 @@ async function boot() {
 }
 
 boot().catch((error) => {
-  text('phase', 'BOOT FAILED');
   showError(`Could not start Arkade City: ${String(error)}`);
 });
