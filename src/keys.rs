@@ -10,6 +10,7 @@ use bitcoin::secp256k1::Message;
 use bitcoin::secp256k1::{schnorr, All};
 use bitcoin::XOnlyPublicKey;
 
+#[derive(Clone)]
 pub struct Keys {
     pub secp: Secp256k1<All>,
     pub keypair: Keypair,

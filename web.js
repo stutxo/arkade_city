@@ -1,4 +1,4 @@
-import init, { App } from './pkg/arkade_duel.js?v=0.3.2';
+import init, { App } from './pkg/arkade_duel.js?v=0.3.4';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);

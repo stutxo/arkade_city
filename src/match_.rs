@@ -225,7 +225,8 @@ impl MatchApp {
             game_addr,
             GAME_FUND_SATS,
         )?;
-        let txid = self.send_raw(ark_tx, checkpoints).await?;
+        let master = self.master.clone();
+        let txid = self.send_raw_with(&master, ark_tx, checkpoints).await?;
         self.log_line(format!("funded game key with {GAME_FUND_SATS} sats (tx {txid})"));
         Ok(false) // funds visible on next poll
     }
@@ -289,10 +290,16 @@ impl MatchApp {
     async fn adopt_existing_start(&mut self, host: ark_core::ArkAddress) -> Result<bool> {
         let my_addr = self.my_address().encode();
         let records = self.rest.get_vtxos(&self.my_script_hex(), "").await?;
+        // Same fallback as the collector: arkTxid can be empty; the outpoint
+        // txid is the creating virtual tx for offchain outputs.
         let txids: Vec<String> = records
             .iter()
-            .filter_map(|r| r.ark_txid.clone())
-            .filter(|t| t.len() == 64)
+            .map(|r| {
+                r.ark_txid
+                    .clone()
+                    .filter(|t| t.len() == 64)
+                    .unwrap_or_else(|| r.outpoint.txid.to_string())
+            })
             .collect();
         if txids.is_empty() {
             return Ok(false);
@@ -354,8 +361,20 @@ impl MatchApp {
         ark_tx: bitcoin::Psbt,
         checkpoints: Vec<bitcoin::Psbt>,
     ) -> Result<Txid> {
+        let keys = self.keys.clone();
+        self.send_raw_with(&keys, ark_tx, checkpoints).await
+    }
+
+    /// Same as [`send_raw`], but signs with an explicit key. Funding sends
+    /// spend master-key inputs and must be signed by the master key.
+    async fn send_raw_with(
+        &mut self,
+        keys: &Keys,
+        ark_tx: bitcoin::Psbt,
+        checkpoints: Vec<bitcoin::Psbt>,
+    ) -> Result<Txid> {
         self.sending = true;
-        let result = txbuild::run_tx(&self.keys, &self.rest, ark_tx, checkpoints).await;
+        let result = txbuild::run_tx(keys, &self.rest, ark_tx, checkpoints).await;
         self.sending = false;
         let txid = result?;
         self.sent_txids.insert(txid);
