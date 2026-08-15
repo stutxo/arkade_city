@@ -5,8 +5,8 @@ page; every move and every shot is an Arkade transaction, and the match is
 replayed and verified from the two players' transaction chains. No game
 server, no escrow, no wager.
 
-- Movement inputs (`w`/`a`/`s`/`d` keymask) ride in zero-value OP_RETURN
-  outputs of chained self-send transactions.
+- Movement is discrete: each keypress is one 25px step, sent as a zero-value
+  OP_RETURN in a chained self-send transaction (up to 4 steps per tx).
 - Shooting burns one unit of the shooter's per-match bullet asset, so ammo
   is enforced by operator-validated asset conservation.
 - The share link is just the host's Arkade address (`/#tark1…`); the joiner
@@ -53,9 +53,12 @@ current network.
    Boarding from onchain is not implemented in the WASM client.
 3. **Host**: click HOST NEW GAME and send the link. **Join**: open the link
    and click ACCEPT & SEND START TX.
-4. WASD moves, SPACE fires. One hit wins. The page polls the indexer and
-   replays the canonical input log; when both clients' END state hashes
-   match, the result is marked verified.
+4. Each match runs on a fresh per-game keypair (new address per game), funded
+   automatically from your master key with a 5000-sat offchain send.
+5. The simulation is fully event-sourced: no clocks, no drift — both clients
+   compute identical positions from the ordered input log. Bullets advance
+   one step per event and use swept collision. One hit wins; when both
+   clients' END state hashes match, the result is marked verified.
 
 ## Repo layout
 

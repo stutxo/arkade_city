@@ -62,8 +62,11 @@ pub struct MatchApp {
     sent_txids: HashSet<Txid>,
 
     events: Vec<Event>,
-    /// Virtual txids already parsed.
+    /// Virtual txids successfully fetched and parsed.
     seen_txs: HashSet<Txid>,
+    /// Fetch failures per txid; after a few tries an id is treated as
+    /// non-virtual (boarding/commitment) and skipped permanently.
+    fetch_failures: std::collections::HashMap<Txid, u32>,
 
     pub sim: Option<Sim>,
     pub sim_inputs: Vec<Input>,
@@ -106,6 +109,7 @@ impl MatchApp {
             sent_txids: HashSet::new(),
             events: Vec::new(),
             seen_txs: HashSet::new(),
+            fetch_failures: std::collections::HashMap::new(),
             sim: None,
             sim_inputs: Vec::new(),
             sending: false,
@@ -506,12 +510,27 @@ impl MatchApp {
         Ok(())
     }
 
-    /// Handle a one-shot UI command ("host" / "join"). Idempotent by phase.
-    /// State-changing; callers should persist right after this returns.
+    /// Handle a one-shot UI command ("host" / "join"). State-changing;
+    /// callers should persist right after this returns.
     pub async fn handle_command(&mut self, command: &str, arg: &str) {
         match command {
-            "host" if matches!(self.phase, Phase::Idle) => self.host_game(),
-            "join" if matches!(self.phase, Phase::Idle | Phase::JoinFunding) => {
+            // A new game is always allowed: reset local match state first so
+            // the same wallet can play back-to-back matches.
+            "host" => {
+                if self.phase != Phase::Idle {
+                    self.reset_match();
+                }
+                self.host_game();
+            }
+            "join" => {
+                let already_on_it = matches!(self.phase, Phase::JoinFunding | Phase::JoinSent)
+                    && self.opponent_addr.map(|a| a.encode()) == Some(arg.to_string());
+                if already_on_it {
+                    return; // duplicate click on the same invite
+                }
+                if self.phase != Phase::Idle {
+                    self.reset_match();
+                }
                 if let Err(e) = self.join_game(arg).await {
                     self.log_line("join failed");
                     self.handle_send_error(&e);
@@ -620,29 +639,55 @@ impl MatchApp {
                 .map(str::to_string)
                 .unwrap_or_else(|| r.outpoint.txid.to_string());
             let Ok(parsed) = candidate.parse::<Txid>() else { continue };
-            if !self.seen_txs.contains(&parsed) {
-                self.seen_txs.insert(parsed);
-                new_txids.push(candidate);
+            if self.seen_txs.contains(&parsed) {
+                continue;
             }
+            if self.fetch_failures.get(&parsed).is_some_and(|n| *n >= 5) {
+                continue; // gave up: almost certainly not a virtual tx
+            }
+            new_txids.push(candidate);
         }
         if new_txids.is_empty() {
             return Ok(());
         }
         // Fetch in one batch; if any txid isn't a virtual tx (e.g. a batch
         // commitment from the outpoint fallback), retry one-by-one so a
-        // single bad id doesn't hide real events.
-        let txs = match self.rest.get_virtual_txs(&new_txids).await {
-            Ok(txs) => txs,
+        // single bad id doesn't hide real events. Only mark txids seen when
+        // they were actually fetched — the indexer can serve the VTXO record
+        // before the virtual tx, and a poisoned seen-set loses events forever
+        // (that was the divergent-clients bug).
+        let mut fetched: Vec<bitcoin::Psbt> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        match self.rest.get_virtual_txs(&new_txids).await {
+            Ok(txs) => fetched = txs,
             Err(_) => {
-                let mut acc = Vec::new();
                 for id in &new_txids {
-                    if let Ok(mut txs) = self.rest.get_virtual_txs(&[id.clone()]).await {
-                        acc.append(&mut txs);
+                    match self.rest.get_virtual_txs(&[id.clone()]).await {
+                        Ok(mut txs) => fetched.append(&mut txs),
+                        Err(_) => failed.push(id.clone()),
                     }
                 }
-                acc
             }
-        };
+        }
+        // The batch can also partially succeed; index what we have and retry
+        // the rest next poll.
+        let mut fetched_ids: HashSet<Txid> = fetched
+            .iter()
+            .map(|p| p.unsigned_tx.compute_txid())
+            .collect();
+        if !failed.is_empty() || fetched_ids.len() < new_txids.len() {
+            // Anything not fetched stays unseen.
+        }
+        for id in &new_txids {
+            if let Ok(txid) = id.parse::<Txid>() {
+                if fetched_ids.remove(&txid) {
+                    self.seen_txs.insert(txid);
+                } else {
+                    *self.fetch_failures.entry(txid).or_insert(0) += 1;
+                }
+            }
+        }
+        let txs = fetched;
         let my_pk = self.keys.owner_pk();
         let my_pk_bytes = my_pk.serialize();
         let master_pk_bytes = self.master.owner_pk().serialize();
