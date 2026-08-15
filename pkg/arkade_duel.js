@@ -91,38 +91,29 @@ export class App {
      * The single serialized entry point.
      *
      * * `command`: "", "host", "join" (`arg` = host address), or "reset"
-     * * `mask`: current WASD key bitmask (see `keyMask`)
+     * * `dirs`: direction presses since the previous step (0=up 1=right
+     *   2=down 3=left) — each becomes one discrete step on-chain
      * * `fires`: number of fire presses since the previous step
      *
      * Returns the JSON snapshot for rendering.
      * @param {string} command
      * @param {string} arg
-     * @param {number} mask
+     * @param {Uint8Array} dirs
      * @param {number} fires
      * @returns {Promise<any>}
      */
-    step(command, arg, mask, fires) {
+    step(command, arg, dirs, fires) {
         const ptr0 = passStringToWasm0(command, wasm.__wbindgen_export, wasm.__wbindgen_export2);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(arg, wasm.__wbindgen_export, wasm.__wbindgen_export2);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.app_step(this.__wbg_ptr, ptr0, len0, ptr1, len1, mask, fires);
+        const ptr2 = passArray8ToWasm0(dirs, wasm.__wbindgen_export);
+        const len2 = WASM_VECTOR_LEN;
+        const ret = wasm.app_step(this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2, fires);
         return takeObject(ret);
     }
 }
 if (Symbol.dispose) App.prototype[Symbol.dispose] = App.prototype.free;
-
-/**
- * @param {boolean} w
- * @param {boolean} a
- * @param {boolean} s
- * @param {boolean} d
- * @returns {number}
- */
-export function keyMask(w, a, s, d) {
-    const ret = wasm.keyMask(w, a, s, d);
-    return ret;
-}
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
@@ -262,7 +253,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_3429(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_3450(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -288,7 +279,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_3429(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_3450(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -421,7 +412,7 @@ function __wbg_get_imports() {
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 718, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_3427);
+            const ret = makeMutClosure(arg0, arg1, __wasm_bindgen_func_elem_3448);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0) {
@@ -458,10 +449,10 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_3427(arg0, arg1, arg2) {
+function __wasm_bindgen_func_elem_3448(arg0, arg1, arg2) {
     try {
         const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-        wasm.__wasm_bindgen_func_elem_3427(retptr, arg0, arg1, addHeapObject(arg2));
+        wasm.__wasm_bindgen_func_elem_3448(retptr, arg0, arg1, addHeapObject(arg2));
         var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
         var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
         if (r1) {
@@ -472,8 +463,8 @@ function __wasm_bindgen_func_elem_3427(arg0, arg1, arg2) {
     }
 }
 
-function __wasm_bindgen_func_elem_3429(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_3429(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_3450(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_3450(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const AppFinalization = (typeof FinalizationRegistry === 'undefined')
@@ -634,6 +625,13 @@ function makeMutClosure(arg0, arg1, f) {
     };
     CLOSURE_DTORS.register(real, state, state);
     return real;
+}
+
+function passArray8ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 1, 1) >>> 0;
+    getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
 }
 
 function passStringToWasm0(arg, malloc, realloc) {

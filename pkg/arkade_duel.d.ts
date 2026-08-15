@@ -22,15 +22,14 @@ export class App {
      * The single serialized entry point.
      *
      * * `command`: "", "host", "join" (`arg` = host address), or "reset"
-     * * `mask`: current WASD key bitmask (see `keyMask`)
+     * * `dirs`: direction presses since the previous step (0=up 1=right
+     *   2=down 3=left) — each becomes one discrete step on-chain
      * * `fires`: number of fire presses since the previous step
      *
      * Returns the JSON snapshot for rendering.
      */
-    step(command: string, arg: string, mask: number, fires: number): Promise<any>;
+    step(command: string, arg: string, dirs: Uint8Array, fires: number): Promise<any>;
 }
-
-export function keyMask(w: boolean, a: boolean, s: boolean, d: boolean): number;
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
@@ -41,8 +40,7 @@ export interface InitOutput {
     readonly app_exportKey: (a: number, b: number) => void;
     readonly app_init: (a: number, b: number) => number;
     readonly app_network: (a: number, b: number) => void;
-    readonly app_step: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => number;
-    readonly keyMask: (a: number, b: number, c: number, d: number) => number;
+    readonly app_step: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
     readonly rustsecp256k1_v0_12_context_create: (a: number) => number;
     readonly rustsecp256k1_v0_12_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_12_default_error_callback_fn: (a: number, b: number) => void;
@@ -51,8 +49,8 @@ export interface InitOutput {
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;
     readonly rustsecp256k1_v0_10_0_default_illegal_callback_fn: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_3427: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_3429: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_3448: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_3450: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

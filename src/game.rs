@@ -1,33 +1,34 @@
-//! Deterministic 1v1 stick-shooter simulation.
+//! Deterministic 1v1 stick-shooter simulation — fully event-sourced.
 //!
-//! Integer math only: the same event log produces bit-identical state on any
-//! machine. Movement is a WASD bitmask; facing derives from the last nonzero
-//! movement direction, so shots need no aim data. One hit wins the match.
+//! No wall clock anywhere: the game state is a pure function of the ordered
+//! event log. A move event steps once in its direction; a fire event spawns
+//! a bullet in the shooter's current facing. Bullets advance once per event,
+//! so late-arriving inputs change *when* you see a state, never *what* it
+//! is. Integer math only.
 
-pub const TICK_MS: u64 = 50; // 20 ticks per second
 pub const ARENA_W: i32 = 800;
 pub const ARENA_H: i32 = 450;
-pub const PLAYER_SPEED: i32 = 4;
-pub const PLAYER_SPEED_DIAG: i32 = 3;
-pub const BULLET_SPEED: i32 = 10;
-pub const BULLET_SPEED_DIAG: i32 = 7;
-pub const BULLET_LIFE_TICKS: u64 = 100;
-pub const FIRE_COOLDOWN_TICKS: u64 = 15;
-pub const HIT_RADIUS_SQ: i32 = 14 * 14;
+pub const STEP: i32 = 25;
+pub const BULLET_STEP: i32 = 30;
+/// Bullet lifetime measured in applied events.
+pub const BULLET_TICKS: u64 = 40;
+pub const FIRE_COOLDOWN: u64 = 3;
 pub const START_AMMO: u32 = 20;
+pub const HIT_RADIUS_SQ: i32 = 14 * 14;
 
-pub const KEY_W: u8 = 1;
-pub const KEY_A: u8 = 2;
-pub const KEY_S: u8 = 4;
-pub const KEY_D: u8 = 8;
+/// Direction encoding in move payloads.
+pub const DIR_UP: u8 = 0;
+pub const DIR_RIGHT: u8 = 1;
+pub const DIR_DOWN: u8 = 2;
+pub const DIR_LEFT: u8 = 3;
 
 /// A simulation input, extracted from the ordered game log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Input {
-    /// Player's pressed-key bitmask effective from this tick.
-    Move { side: usize, tick: u64, keys: u8 },
-    /// Player fired at this tick (facing/position recomputed by the sim).
-    Fire { side: usize, tick: u64 },
+    /// Player stepped once in `dir`.
+    Move { side: usize, dir: u8 },
+    /// Player fired in their current facing direction.
+    Fire { side: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,114 +49,129 @@ pub enum Phase {
 
 #[derive(Clone, Debug)]
 pub struct Sim {
+    /// Number of events applied (logical time).
     pub tick: u64,
     pub pos: [(i32, i32); 2],
-    pub keys: [u8; 2],
-    pub facing: [(i32, i32); 2],
+    /// Last move direction per side (bullets fly this way).
+    pub facing: [u8; 2],
     pub bullets: Vec<Bullet>,
     pub ammo: [u32; 2],
     pub last_fire_tick: [u64; 2],
     pub phase: Phase,
-    /// Tick the match starts at (both players spawn, sim ignores earlier time).
-    pub start_tick: u64,
+}
+
+/// Integer-exact point-to-segment distance check: true iff the segment
+/// (x0,y0)-(x1,y1) passes within `radius_sq` of (px,py).
+fn segment_near_point(x0: i32, y0: i32, x1: i32, y1: i32, px: i32, py: i32, radius_sq: i32) -> bool {
+    let dx = (x1 - x0) as i64;
+    let dy = (y1 - y0) as i64;
+    let ax = (px - x0) as i64;
+    let ay = (py - y0) as i64;
+    let bx = (px - x1) as i64;
+    let by = (py - y1) as i64;
+    let r = radius_sq as i64;
+
+    let len_sq = dx * dx + dy * dy;
+    if len_sq == 0 {
+        return ax * ax + ay * ay <= r;
+    }
+    if ax * dx + ay * dy <= 0 {
+        // closest to the start point
+        return ax * ax + ay * ay <= r;
+    }
+    if bx * dx + by * dy >= 0 {
+        // closest to the end point
+        return bx * bx + by * by <= r;
+    }
+    // perpendicular distance² = cross² / len² ≤ r²  ⟺  cross² ≤ r² · len²
+    let cross = ax * dy - ay * dx;
+    cross * cross <= r * len_sq
+}
+
+fn dir_delta(dir: u8) -> (i32, i32) {
+    match dir {
+        DIR_UP => (0, -1),
+        DIR_DOWN => (0, 1),
+        DIR_LEFT => (-1, 0),
+        DIR_RIGHT => (1, 0),
+        _ => (0, 0),
+    }
 }
 
 impl Sim {
-    pub fn new(start_tick: u64) -> Self {
+    pub fn new() -> Self {
         Self {
-            tick: start_tick,
+            tick: 0,
             pos: [(60, ARENA_H / 2), (ARENA_W - 60, ARENA_H / 2)],
-            keys: [0; 2],
-            facing: [(1, 0), (-1, 0)],
+            facing: [DIR_RIGHT, DIR_LEFT],
             bullets: Vec::new(),
             ammo: [START_AMMO; 2],
-            last_fire_tick: [0; 2],
+            // u64::MAX = "never fired" (0 would block the opening shots)
+            last_fire_tick: [u64::MAX; 2],
             phase: Phase::Playing,
-            start_tick,
         }
     }
 
-    /// Advance the simulation to `target_tick`, applying `inputs` in order.
-    /// `inputs` must be sorted by tick (stable); events at or before the
-    /// current tick are applied immediately.
-    pub fn run(&mut self, inputs: &[Input], target_tick: u64) {
-        let mut idx = 0;
-        while self.tick <= target_tick {
-            // Apply all inputs scheduled at or before this tick.
-            while idx < inputs.len() && input_tick(&inputs[idx]) <= self.tick {
-                self.apply(&inputs[idx]);
-                idx += 1;
-            }
+    /// Apply the ordered event slice. Both clients converge to identical
+    /// state whenever they have seen the same events — regardless of when.
+    pub fn run(&mut self, inputs: &[Input]) {
+        for input in inputs {
             if matches!(self.phase, Phase::Done { .. }) {
                 break;
             }
-            self.step();
+            self.apply(input);
             self.tick += 1;
-        }
-        // Flush remaining inputs due at the target boundary.
-        while idx < inputs.len() && input_tick(&inputs[idx]) <= target_tick {
-            self.apply(&inputs[idx]);
-            idx += 1;
         }
     }
 
     fn apply(&mut self, input: &Input) {
         match *input {
-            Input::Move { side, keys, .. } => {
-                self.keys[side] = keys;
-                let (dx, dy) = dir_of(keys);
-                if dx != 0 || dy != 0 {
-                    self.facing[side] = (dx, dy);
+            Input::Move { side, dir } => {
+                if dir > DIR_LEFT {
+                    return; // unknown direction: ignore, keep determinism
                 }
+                self.facing[side] = dir;
+                let (dx, dy) = dir_delta(dir);
+                let nx = (self.pos[side].0 + dx * STEP).clamp(10, ARENA_W - 10);
+                let ny = (self.pos[side].1 + dy * STEP).clamp(10, ARENA_H - 10);
+                self.pos[side] = (nx, ny);
             }
-            Input::Fire { side, tick } => {
+            Input::Fire { side } => {
                 if self.ammo[side] == 0 {
                     return;
                 }
-                if tick < self.last_fire_tick[side] + FIRE_COOLDOWN_TICKS
-                    && self.last_fire_tick[side] != 0
-                {
+                let last = self.last_fire_tick[side];
+                if last != u64::MAX && self.tick < last + FIRE_COOLDOWN {
                     return;
                 }
                 self.ammo[side] -= 1;
-                self.last_fire_tick[side] = tick;
-                let (fx, fy) = self.facing[side];
-                let (dx, dy) = bullet_velocity(fx, fy);
+                self.last_fire_tick[side] = self.tick;
+                let (fx, fy) = dir_delta(self.facing[side]);
                 self.bullets.push(Bullet {
                     x: self.pos[side].0 + fx * 16,
                     y: self.pos[side].1 + fy * 16,
-                    dx,
-                    dy,
-                    born_tick: tick,
+                    dx: fx * BULLET_STEP,
+                    dy: fy * BULLET_STEP,
+                    born_tick: self.tick,
                     side,
                 });
             }
         }
+        self.advance_bullets();
     }
 
-    fn step(&mut self) {
-        // Players.
-        for side in 0..2 {
-            let (dx, dy) = dir_of(self.keys[side]);
-            let (sx, sy) = if dx != 0 && dy != 0 {
-                (PLAYER_SPEED_DIAG, PLAYER_SPEED_DIAG)
-            } else {
-                (PLAYER_SPEED, PLAYER_SPEED)
-            };
-            let nx = (self.pos[side].0 + dx * sx).clamp(10, ARENA_W - 10);
-            let ny = (self.pos[side].1 + dy * sy).clamp(10, ARENA_H - 10);
-            self.pos[side] = (nx, ny);
-        }
-        // Bullets.
-        let mut hits: Option<usize> = None;
+    fn advance_bullets(&mut self) {
+        let mut winner = None;
         for b in &mut self.bullets {
+            let (x0, y0) = (b.x, b.y);
             b.x += b.dx;
             b.y += b.dy;
+            // Swept collision: the bullet's path segment vs the victim's
+            // position — otherwise a 30px step can jump over the hitbox.
             let victim = 1 - b.side;
-            let ddx = b.x - self.pos[victim].0;
-            let ddy = b.y - self.pos[victim].1;
-            if ddx * ddx + ddy * ddy <= HIT_RADIUS_SQ {
-                hits = Some(b.side);
+            let (px, py) = self.pos[victim];
+            if segment_near_point(x0, y0, b.x, b.y, px, py, HIT_RADIUS_SQ) {
+                winner = Some(b.side);
             }
         }
         self.bullets.retain(|b| {
@@ -163,11 +179,10 @@ impl Sim {
                 && b.x <= ARENA_W
                 && b.y >= 0
                 && b.y <= ARENA_H
-                && self.tick < b.born_tick + BULLET_LIFE_TICKS
-                && hits != Some(b.side)
+                && self.tick < b.born_tick + BULLET_TICKS
         });
-        if let Some(winner) = hits {
-            self.phase = Phase::Done { winner };
+        if let Some(side) = winner {
+            self.phase = Phase::Done { winner: side };
             self.bullets.clear();
         }
     }
@@ -193,44 +208,6 @@ impl Sim {
     }
 }
 
-fn input_tick(input: &Input) -> u64 {
-    match *input {
-        Input::Move { tick, .. } | Input::Fire { tick, .. } => tick,
-    }
-}
-
-/// WASD bitmask -> (dx, dy) direction in {-1, 0, 1}.
-pub fn dir_of(keys: u8) -> (i32, i32) {
-    let mut dx = 0;
-    let mut dy = 0;
-    if keys & KEY_W != 0 {
-        dy -= 1;
-    }
-    if keys & KEY_S != 0 {
-        dy += 1;
-    }
-    if keys & KEY_A != 0 {
-        dx -= 1;
-    }
-    if keys & KEY_D != 0 {
-        dx += 1;
-    }
-    (dx, dy)
-}
-
-fn bullet_velocity(fx: i32, fy: i32) -> (i32, i32) {
-    if fx != 0 && fy != 0 {
-        (fx * BULLET_SPEED_DIAG, fy * BULLET_SPEED_DIAG)
-    } else {
-        (fx * BULLET_SPEED, fy * BULLET_SPEED)
-    }
-}
-
-/// Current wall-clock tick.
-pub fn tick_of_unix_ms(ms: u64) -> u64 {
-    ms / TICK_MS
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,38 +215,54 @@ mod tests {
     #[test]
     fn movement_is_deterministic() {
         let inputs = [
-            Input::Move { side: 0, tick: 10, keys: KEY_D },
-            Input::Move { side: 1, tick: 12, keys: KEY_A },
+            Input::Move { side: 0, dir: DIR_RIGHT },
+            Input::Move { side: 1, dir: DIR_LEFT },
+            Input::Move { side: 0, dir: DIR_RIGHT },
         ];
-        let mut a = Sim::new(0);
-        a.run(&inputs, 100);
-        let mut b = Sim::new(0);
-        b.run(&inputs, 100);
+        let mut a = Sim::new();
+        a.run(&inputs);
+        let mut b = Sim::new();
+        b.run(&inputs);
         assert_eq!(a.state_hash(), b.state_hash());
-        assert!(a.pos[0].0 > 60);
-        assert!(a.pos[1].0 < ARENA_W - 60);
+        assert_eq!(a.pos[0], (60 + 2 * STEP, ARENA_H / 2));
+        assert_eq!(a.pos[1], (ARENA_W - 60 - STEP, ARENA_H / 2));
     }
 
     #[test]
-    fn straight_shot_hits() {
-        // Player 0 at (60, 225) faces right; player 1 idle at (740, 225).
-        // Fire at tick 5; bullet needs ~73 ticks to cross. One hit wins.
-        let inputs = [Input::Fire { side: 0, tick: 5 }];
-        let mut sim = Sim::new(0);
-        sim.run(&inputs, 200);
-        assert_eq!(sim.phase, Phase::Done { winner: 0 });
-    }
-
-    #[test]
-    fn ammo_is_enforced() {
-        let mut inputs = Vec::new();
-        for i in 0..25u64 {
-            inputs.push(Input::Fire { side: 0, tick: 10 + i * (FIRE_COOLDOWN_TICKS + 1) });
+    fn bullet_hits_stationary_opponent() {
+        // Player 0 fires east from (60,225); player 1 at (740,225) strafes
+        // along the firing line (left/right only) to advance bullet time.
+        let mut inputs = vec![Input::Fire { side: 0 }];
+        for _ in 0..30 {
+            inputs.push(Input::Move { side: 1, dir: DIR_LEFT });
+            inputs.push(Input::Move { side: 1, dir: DIR_RIGHT });
         }
-        let mut sim = Sim::new(0);
-        sim.run(&inputs, 10 + 25 * (FIRE_COOLDOWN_TICKS + 1) + BULLET_LIFE_TICKS + 10);
+        let mut sim = Sim::new();
+        sim.run(&inputs);
+        assert_eq!(sim.phase, Phase::Done { winner: 0 });
+        assert_eq!(sim.ammo[0], START_AMMO - 1);
+    }
+
+    #[test]
+    fn ammo_and_cooldown_enforced() {
+        // Move the target off the firing line first, then spam fire: the
+        // cooldown (3 events) limits rate; ammo caps total shots at 20.
+        let mut inputs = vec![Input::Move { side: 1, dir: DIR_UP }];
+        for _ in 0..START_AMMO * 3 {
+            inputs.push(Input::Fire { side: 0 });
+            // keep the game clock moving without ending the match
+            inputs.push(Input::Move { side: 1, dir: DIR_LEFT });
+        }
+        let mut sim = Sim::new();
+        sim.run(&inputs);
         assert_eq!(sim.ammo[0], 0);
-        // 20 bullets fired, no more.
-        assert!(matches!(sim.phase, Phase::Done { winner: 0 }));
+        assert!(matches!(sim.phase, Phase::Playing));
+    }
+
+    #[test]
+    fn unknown_direction_ignored() {
+        let mut sim = Sim::new();
+        sim.run(&[Input::Move { side: 0, dir: 99 }]);
+        assert_eq!(sim.pos[0], (60, ARENA_H / 2));
     }
 }

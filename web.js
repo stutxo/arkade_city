@@ -1,4 +1,4 @@
-import init, { App, keyMask } from './pkg/arkade_duel.js?v=0.2.6';
+import init, { App } from './pkg/arkade_duel.js?v=0.3.0';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -13,7 +13,9 @@ const fragmentAddr = location.hash.startsWith('#') ? location.hash.slice(1) : ''
 // Inputs and commands are plain JS variables handed over as arguments.
 // ---------------------------------------------------------------------------
 
-const keysDown = { w: false, a: false, s: false, d: false };
+// Discrete inputs: each keypress queues one on-chain step (w=up, d=right,
+// s=down, a=left). Key autorepeat is ignored — one press, one move event.
+let dirsQueue = [];
 let fireCount = 0;
 let command = '';        // '', 'host', 'join'
 let commandArg = '';
@@ -64,13 +66,12 @@ async function boot() {
 
   $('host-btn').onclick = () => {
     command = 'host';
-    // Carry the network in the link so the joiner lands in the right place.
-    const q = onMainnet ? '' : `?server=${serverUrl}`;
-    const link = `${location.origin}${location.pathname}${q}#${app.address()}`;
-    setText('host-link', link);
+    // The game key is generated when the host command processes; the link
+    // appears once the next snapshot carries the fresh game address.
+    setText('host-link', 'preparing…');
     show('host-link-row');
-    $('copy-link').onclick = () => navigator.clipboard.writeText(link);
   };
+  $('copy-link').onclick = () => navigator.clipboard.writeText($('host-link').textContent);
 
   $('join-btn').onclick = () => {
     command = 'join';
@@ -93,7 +94,8 @@ async function boot() {
 async function driver() {
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    const mask = keyMask(keysDown.w, keysDown.a, keysDown.s, keysDown.d);
+    const dirs = dirsQueue;
+    dirsQueue = [];
     const fires = fireCount;
     fireCount = 0;
     const cmd = command;
@@ -101,7 +103,7 @@ async function driver() {
     command = '';
     commandArg = '';
     try {
-      lastSnapshot = await app.step(cmd, arg, mask, fires);
+      lastSnapshot = await app.step(cmd, arg, new Uint8Array(dirs), fires);
       applySnapshot(lastSnapshot);
     } catch (e) {
       console.warn('step failed', e);
@@ -132,6 +134,11 @@ function applySnapshot(s) {
   setText('phase', (s.phase ?? 'unknown') + (s.sending ? ' (sending…)' : ''));
   setText('version', s.version || 'unknown');
   applyNetwork(s.network);
+  // Once hosting, the link carries the per-game address (never the master).
+  if (s.gameAddress && (s.phase === 'hosting' || s.phase === 'join-sent')) {
+    const q = onMainnet ? '' : `?server=${serverUrl}`;
+    setText('host-link', `${location.origin}${location.pathname}${q}#${s.gameAddress}`);
+  }
   setText('match-id', s.matchId || '—');
   setText('balance', s.balance === undefined ? '…' : `${s.balance} sats`);
   const ago = s.lastSyncMs ? Math.max(0, Math.round((Date.now() - s.lastSyncMs) / 1000)) : null;
@@ -179,15 +186,14 @@ function applyNetwork(network) {
   }
 }
 
+const DIR = { w: 0, d: 1, s: 2, a: 3 };
+
 function bindKeys() {
   addEventListener('keydown', (e) => {
+    if (e.repeat) return;
     const k = e.key.toLowerCase();
-    if (k in keysDown) { keysDown[k] = true; e.preventDefault(); }
+    if (k in DIR) { dirsQueue.push(DIR[k]); e.preventDefault(); }
     if (k === ' ') { fireCount += 1; e.preventDefault(); }
-  });
-  addEventListener('keyup', (e) => {
-    const k = e.key.toLowerCase();
-    if (k in keysDown) { keysDown[k] = false; e.preventDefault(); }
   });
 }
 

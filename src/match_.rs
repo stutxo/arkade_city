@@ -1,30 +1,34 @@
 //! Match orchestration: handshake, asset issuance, event tx sending,
 //! polling, causal ordering, and deterministic replay.
 //!
-//! No server: the host's Arkade address travels in the share link, the joiner
-//! answers with a START tx, and from then on both clients watch both players'
-//! VTXO scripts through the public indexer.
+//! No server: the host's per-game Arkade address travels in the share link,
+//! the joiner answers with a START tx, and from then on both clients watch
+//! both players' VTXO scripts through the public indexer.
+//!
+//! Each match uses a FRESH keypair (new address per game), funded from the
+//! master key with one plain offchain send. The master key is the funding
+//! identity shown in the UI; the game key is the match identity in the link.
 
 use crate::arkade::{ArkadeRest, ServerParams, VtxoRecord};
 use crate::game::{Input, Phase as SimPhase, Sim};
 use crate::gamelog::{order_events, payloads_from_tx, Event, Kind, Msg};
 use crate::keys::Keys;
 use crate::{gamelog, txbuild};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use ark_core::asset::AssetId;
 use bitcoin::Txid;
 use std::collections::HashSet;
 
 pub const BULLET_SUPPLY: u64 = crate::game::START_AMMO as u64;
-/// Grace period between the ACK timestamp and match start (ms).
-pub const START_GRACE_MS: u64 = 5_000;
+/// Sats moved from the master key into a fresh game key at match start.
+pub const GAME_FUND_SATS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Idle,
     /// Host: waiting for a START tx to arrive.
     Hosting,
-    /// Joiner: need a spendable VTXO to send START.
+    /// Joiner/host: funding the game key from the master key.
     JoinFunding,
     /// Joiner: START sent, waiting for the host's ACK.
     JoinSent,
@@ -35,6 +39,10 @@ pub enum Phase {
 }
 
 pub struct MatchApp {
+    /// The persistent funding identity (shown in the UI, funded externally).
+    pub master: Keys,
+    /// The active signing identity: the master key when idle, a fresh
+    /// per-match key once hosting/joining.
     pub keys: Keys,
     pub rest: ArkadeRest,
     pub params: ServerParams,
@@ -62,7 +70,8 @@ pub struct MatchApp {
 
     /// A send is in flight (wasm is single-threaded; this serializes sends).
     pub sending: bool,
-    pub pending_move: Option<u8>,
+    /// Queued direction presses (dir bytes), packed into move txs.
+    pub pending_dirs: Vec<u8>,
     pub pending_fires: u32,
     /// Outpoints the operator reports as spent by a pending tx we crashed
     /// mid-finalize; skipped when picking inputs.
@@ -71,8 +80,6 @@ pub struct MatchApp {
     last_poll_error: Option<String>,
     /// Wall-clock ms of the last successful poll (UI proof of life).
     last_sync_ms: u64,
-    /// Last key bitmask queued (for change detection in `step`).
-    last_mask: u8,
     /// Balance cached from the latest poll, for the snapshot.
     balance_cache: u64,
 
@@ -80,10 +87,12 @@ pub struct MatchApp {
 }
 
 impl MatchApp {
-    pub fn new(keys: Keys, rest: ArkadeRest, params: ServerParams) -> Self {
+    pub fn new(master: Keys, rest: ArkadeRest, params: ServerParams) -> Self {
         let info = txbuild::server_info(&params);
+        let active = Keys::from_hex(&master.secret_hex()).expect("same key");
         Self {
-            keys,
+            master,
+            keys: active,
             rest,
             params,
             info,
@@ -100,17 +109,39 @@ impl MatchApp {
             sim: None,
             sim_inputs: Vec::new(),
             sending: false,
-            pending_move: None,
+            pending_dirs: Vec::new(),
             pending_fires: 0,
             excluded_outpoints: HashSet::new(),
             last_poll_error: None,
             last_sync_ms: 0,
-            last_mask: 0,
             balance_cache: 0,
             log: Vec::new(),
         }
     }
 
+    fn in_match(&self) -> bool {
+        self.game_key_hex().is_some()
+    }
+
+    /// The game key hex, if a per-match key is active.
+    fn game_key_hex(&self) -> Option<String> {
+        let active = self.keys.secret_hex();
+        (active != self.master.secret_hex()).then_some(active)
+    }
+
+    fn new_game_key(&mut self) {
+        self.keys = Keys::generate().expect("rng");
+        self.log_line("new game key → fresh address for this match");
+    }
+
+    /// The address to show for funding: the master key's.
+    pub fn funding_address(&self) -> ark_core::ArkAddress {
+        txbuild::player_vtxo(&self.master, &self.params)
+            .expect("vtxo")
+            .to_ark_address()
+    }
+
+    /// The active (match) address: goes into links and START payloads.
     pub fn my_address(&self) -> ark_core::ArkAddress {
         txbuild::player_vtxo(&self.keys, &self.params)
             .expect("vtxo")
@@ -124,6 +155,13 @@ impl MatchApp {
             .to_hex_string()
     }
 
+    fn master_script_hex(&self) -> String {
+        txbuild::player_vtxo(&self.master, &self.params)
+            .expect("vtxo")
+            .script_pubkey()
+            .to_hex_string()
+    }
+
     fn log_line(&mut self, line: impl Into<String>) {
         self.log.push(line.into());
         if self.log.len() > 200 {
@@ -131,45 +169,101 @@ impl MatchApp {
         }
     }
 
-    /// My spendable VTXOs on my default script.
+    async fn spendable_for(&self, keys: &Keys) -> Result<Vec<VtxoRecord>> {
+        let script = txbuild::player_vtxo(keys, &self.params)?
+            .script_pubkey()
+            .to_hex_string();
+        self.rest.get_vtxos(&script, "spendableOnly").await
+    }
+
+    /// My spendable VTXOs on the active script.
     pub async fn my_spendable(&self) -> Result<Vec<VtxoRecord>> {
-        self.rest
-            .get_vtxos(&self.my_script_hex(), "spendableOnly")
-            .await
+        self.spendable_for(&self.keys).await
     }
 
     pub async fn balance_sats(&self) -> Result<u64> {
-        Ok(self.my_spendable().await?.iter().map(|v| v.amount_sats).sum())
+        let master: u64 = self
+            .spendable_for(&self.master)
+            .await?
+            .iter()
+            .map(|v| v.amount_sats)
+            .sum();
+        let game: u64 = if self.in_match() {
+            self.my_spendable().await?.iter().map(|v| v.amount_sats).sum()
+        } else {
+            0
+        };
+        Ok(master + game)
     }
 
-    /// Become the host: just wait for a START to land on our script.
+    /// Ensure the active game key holds funds; if not, move some from the
+    /// master key with a plain offchain send. Returns true when funded.
+    async fn ensure_game_funded(&mut self) -> Result<bool> {
+        if !self.in_match() {
+            return Ok(true);
+        }
+        if !self.my_spendable().await?.is_empty() {
+            return Ok(true);
+        }
+        let master_spendable = self.spendable_for(&self.master).await?;
+        let funding = master_spendable
+            .iter()
+            .filter(|v| !self.excluded_outpoints.contains(&v.outpoint.to_string()))
+            .max_by_key(|v| v.amount_sats)
+            .cloned()
+            .ok_or_else(|| anyhow!("master wallet is empty — fund your address first"))?;
+        let game_addr = self.my_address();
+        let (ark_tx, checkpoints) = txbuild::build_send_tx(
+            &self.master,
+            &self.params,
+            &self.info,
+            &[funding],
+            game_addr,
+            GAME_FUND_SATS,
+        )?;
+        let txid = self.send_raw(ark_tx, checkpoints).await?;
+        self.log_line(format!("funded game key with {GAME_FUND_SATS} sats (tx {txid})"));
+        Ok(false) // funds visible on next poll
+    }
+
+    /// Become the host: fresh game key/address, then wait for a START.
     pub fn host_game(&mut self) {
+        self.new_game_key();
         self.phase = Phase::Hosting;
         self.log_line("hosting: share your link, waiting for START tx");
     }
 
     /// Forget all match state (local only; the chains on the indexer are
-    /// immutable). Used by the reset command before a fresh host/join.
+    /// immutable). The game key is dropped; the master key is kept.
     pub fn reset_match(&mut self) {
-        let keys = Keys::from_hex(&self.keys.secret_hex()).expect("same key");
+        let master = Keys::from_hex(&self.master.secret_hex()).expect("same key");
         let rest = self.rest.clone();
         let params = self.params.clone();
-        *self = MatchApp::new(keys, rest, params);
+        *self = MatchApp::new(master, rest, params);
         self.log_line("match state reset");
     }
 
-    /// Join via the host's address: send the START message.
+    /// Join via the host's address: fresh game key, fund it, send START.
     /// Idempotent: if our chain history already contains a START paying this
-    /// host, adopt it instead of sending a second one.
+    /// host (same game key), adopt it instead of sending a second one.
     pub async fn join_game(&mut self, host_address: &str) -> Result<()> {
         let host = ark_core::ArkAddress::decode(host_address)
             .map_err(|e| anyhow!("bad host address: {e}"))?;
-        if let Ok(my_addr) = ark_core::ArkAddress::decode(&self.my_address().encode()) {
-            if my_addr == host {
-                return Err(anyhow!(
-                    "that's your own address — open the invite link on the other player's device/browser (a second tab here shares this wallet)"
-                ));
-            }
+
+        // Rejoining with an active match key? Otherwise start fresh.
+        if !self.in_match() {
+            self.new_game_key();
+        }
+        if host == self.my_address() {
+            return Err(anyhow!(
+                "that's your own address — open the invite link on the other player's device/browser"
+            ));
+        }
+        if !self.ensure_game_funded().await? {
+            self.phase = Phase::JoinFunding;
+            self.opponent_addr = Some(host);
+            self.log_line("funding game key; will send START when it lands");
+            return Ok(());
         }
         if self.adopt_existing_start(host).await? {
             return Ok(());
@@ -212,14 +306,9 @@ impl MatchApp {
     }
 
     async fn send_start(&mut self, host: ark_core::ArkAddress) -> Result<()> {
-        let spendable = self.my_spendable().await?;
-        let Some(funding) = spendable.iter().max_by_key(|v| v.amount_sats).cloned() else {
-            self.phase = Phase::JoinFunding;
-            return Err(anyhow!("no spendable VTXOs; fund your address first"));
-        };
-        // START: dust to the host + our address in the OP_RETURN payload.
-        // The match tag is derived from the START txid, so the embedded tag
-        // stays zero; both sides adopt tag(START txid) once the tx exists.
+        let funding = self.chain_input().await?;
+        // START: dust to the host + our game address in the OP_RETURN payload.
+        // The match tag derives from the START txid once the tx exists.
         let msg = Msg {
             match_tag: [0; 8],
             seq: self.seq,
@@ -246,7 +335,11 @@ impl MatchApp {
     }
 
     /// Build, sign, submit, finalize; remember the txid as ours.
-    async fn send_raw(&mut self, ark_tx: bitcoin::Psbt, checkpoints: Vec<bitcoin::Psbt>) -> Result<Txid> {
+    async fn send_raw(
+        &mut self,
+        ark_tx: bitcoin::Psbt,
+        checkpoints: Vec<bitcoin::Psbt>,
+    ) -> Result<Txid> {
         self.sending = true;
         let result = txbuild::run_tx(&self.keys, &self.rest, ark_tx, checkpoints).await;
         self.sending = false;
@@ -258,31 +351,31 @@ impl MatchApp {
     }
 
     fn next_msg(&mut self, kind: Kind, data: Vec<u8>) -> Msg {
-        let match_tag = self.match_tag.unwrap_or([0; 8]);
-        // `prev` references our own last tx; causal cross-linking comes from
-        // the interleave on (tick, txid) at replay time.
-        let msg = Msg {
-            match_tag,
+        Msg {
+            match_tag: self.match_tag.unwrap_or([0; 8]),
             seq: self.seq,
             prev: self.last_sent_tag,
             tick_ms: now_ms(),
             kind,
             data,
-        };
-        msg
+        }
     }
 
-    /// Queue a movement input (key bitmask). Coalesces with any pending move.
-    pub fn queue_move(&mut self, keys: u8) {
-        self.pending_move = Some(keys);
+    /// Queue direction presses (dir bytes) and fire presses.
+    pub fn queue_inputs(&mut self, dirs: &[u8], fires: u32) {
+        const MAX_QUEUE: usize = 8;
+        for &d in dirs {
+            if self.pending_dirs.len() < MAX_QUEUE {
+                self.pending_dirs.push(d);
+            }
+        }
+        if fires > 0 {
+            self.pending_fires = (self.pending_fires + fires).min(4);
+        }
     }
 
-    /// Queue a shot.
-    pub fn queue_fire(&mut self) {
-        self.pending_fires = (self.pending_fires + 1).min(4);
-    }
-
-    /// Drive pending sends; call from the refresh loop when not sending.
+    /// Drive pending sends; at most one tx per step (they are serialized and
+    /// each takes a network round trip).
     pub async fn flush_pending(&mut self) -> Result<()> {
         if self.sending || !matches!(self.phase, Phase::Playing) {
             return Ok(());
@@ -294,11 +387,13 @@ impl MatchApp {
             }
             return Ok(());
         }
-        if let Some(keys) = self.pending_move.take() {
-            if let Err(e) = self.send_move(keys).await {
+        if !self.pending_dirs.is_empty() {
+            // Pack up to 4 direction steps into one move tx.
+            let n = self.pending_dirs.len().min(4);
+            let dirs: Vec<u8> = self.pending_dirs.drain(..n).collect();
+            if let Err(e) = self.send_move(&dirs).await {
                 self.handle_send_error(&e);
             }
-            return Ok(());
         }
         Ok(())
     }
@@ -315,50 +410,6 @@ impl MatchApp {
         self.log_line(format!("send failed: {text}"));
     }
 
-    /// Handle a one-shot UI command ("host" / "join"). Idempotent by phase.
-    /// State-changing; callers should persist right after this returns.
-    pub async fn handle_command(&mut self, command: &str, arg: &str) {
-        match command {
-            "host" if matches!(self.phase, Phase::Idle) => self.host_game(),
-            "join" if matches!(self.phase, Phase::Idle | Phase::JoinFunding) => {
-                if let Err(e) = self.join_game(arg).await {
-                    self.log_line("join failed");
-                    self.handle_send_error(&e);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// The serialized driver tick: queue inputs, poll, advance.
-    pub async fn step(&mut self, mask: u8, fires: u32) -> Result<()> {
-        // Queue gameplay inputs.
-        if mask != self.last_mask {
-            self.last_mask = mask;
-            self.queue_move(mask);
-        }
-        if fires > 0 {
-            self.pending_fires = (self.pending_fires + fires).min(4);
-        }
-
-        // Poll, ingest, advance. Poll failures are transient by nature;
-        // surface them in the log, don't throw.
-        if let Err(e) = self.refresh().await {
-            let text = format!("{e:#}");
-            if self.last_poll_error.as_deref() != Some(text.as_str()) {
-                self.last_poll_error = Some(text.clone());
-                self.log_line(format!("sync: {text}"));
-            }
-        } else {
-            self.last_poll_error = None;
-            self.last_sync_ms = now_ms();
-        }
-
-        // Cache the balance for the snapshot.
-        self.balance_cache = self.balance_sats().await.unwrap_or(self.balance_cache);
-        Ok(())
-    }
-
     async fn chain_input(&self) -> Result<VtxoRecord> {
         let spendable = self.my_spendable().await?;
         // Continue from the largest spendable output: the self-send change
@@ -371,13 +422,13 @@ impl MatchApp {
             .ok_or_else(|| anyhow!("no spendable VTXO for event tx"))
     }
 
-    async fn send_move(&mut self, keys: u8) -> Result<()> {
+    async fn send_move(&mut self, dirs: &[u8]) -> Result<()> {
         let input = self.chain_input().await?;
-        let msg = self.next_msg(Kind::Move, vec![keys]);
+        let msg = self.next_msg(Kind::Move, dirs.to_vec());
         let (ark_tx, checkpoints) =
             txbuild::build_event_tx(&self.keys, &self.params, &self.info, &input, &msg.encode())?;
         let txid = self.send_raw(ark_tx, checkpoints).await?;
-        self.log_line(format!("move {keys:04b} → {txid}"));
+        self.log_line(format!("move {:?} → {txid}", dirs));
         Ok(())
     }
 
@@ -419,6 +470,7 @@ impl MatchApp {
         let dust = self.params.dust_sats;
         let input = spendable
             .iter()
+            .filter(|v| !self.excluded_outpoints.contains(&v.outpoint.to_string()))
             .filter(|v| v.amount_sats == dust || v.amount_sats >= 2 * dust)
             .max_by_key(|v| v.amount_sats)
             .cloned()
@@ -454,12 +506,46 @@ impl MatchApp {
         Ok(())
     }
 
+    /// Handle a one-shot UI command ("host" / "join"). Idempotent by phase.
+    /// State-changing; callers should persist right after this returns.
+    pub async fn handle_command(&mut self, command: &str, arg: &str) {
+        match command {
+            "host" if matches!(self.phase, Phase::Idle) => self.host_game(),
+            "join" if matches!(self.phase, Phase::Idle | Phase::JoinFunding) => {
+                if let Err(e) = self.join_game(arg).await {
+                    self.log_line("join failed");
+                    self.handle_send_error(&e);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The serialized driver tick: queue inputs, poll, advance.
+    pub async fn step(&mut self, dirs: &[u8], fires: u32) -> Result<()> {
+        self.queue_inputs(dirs, fires);
+
+        if let Err(e) = self.refresh().await {
+            let text = format!("{e:#}");
+            if self.last_poll_error.as_deref() != Some(text.as_str()) {
+                self.last_poll_error = Some(text.clone());
+                self.log_line(format!("sync: {text}"));
+            }
+        } else {
+            self.last_poll_error = None;
+            self.last_sync_ms = now_ms();
+        }
+
+        self.balance_cache = self.balance_sats().await.unwrap_or(self.balance_cache);
+        Ok(())
+    }
+
     /// Poll indexer, ingest new txs, advance the state machine and sim.
     pub async fn refresh(&mut self) -> Result<()> {
         // 1. Collect new events from both scripts.
-        self.collect_side(0).await?;
-        if let Some(opp) = self.opponent_scripts() {
-            self.collect_side_scripts(1, &opp).await?;
+        self.collect_side().await?;
+        if let Some(opp_script) = self.opponent_script() {
+            self.collect_side_scripts(&[opp_script]).await?;
         }
 
         // 2. State machine transitions driven by what we ingested.
@@ -469,19 +555,27 @@ impl MatchApp {
                     self.adopt_start(tag, joiner).await?;
                 }
             }
+            Phase::JoinFunding => {
+                // The join command ran before the game key was funded; retry.
+                if let Some(host) = self.opponent_addr {
+                    if let Err(e) = self.join_game(&host.encode()).await {
+                        self.handle_send_error(&e);
+                    }
+                }
+            }
             Phase::JoinSent => {
-                if let Some(start_ms) = self.find_ack() {
-                    self.begin_match(start_ms).await?;
+                if self.find_ack() {
+                    self.begin_match().await?;
                 }
             }
             Phase::Arming => {
                 if self.my_bullet_asset.is_none() && !self.sending {
                     if let Err(e) = self.issue_bullets().await {
-                        self.log_line(format!("issuance failed: {e:#}; retrying"));
+                        self.handle_send_error(&e);
                     }
                 } else if self.my_bullet_asset.is_some() {
                     self.phase = Phase::Playing;
-                    self.log_line("match live — WASD moves, space fires");
+                    self.log_line("match live — WASD steps, space fires");
                 }
             }
             Phase::Playing => {
@@ -495,21 +589,19 @@ impl MatchApp {
         Ok(())
     }
 
-    /// The indexer only accepts P2TR script queries; all our messages use
-    /// dust-sized P2TR outputs, so watching the P2TR form is sufficient.
-    fn opponent_scripts(&self) -> Option<[String; 1]> {
+    fn opponent_script(&self) -> Option<String> {
         let addr = self.opponent_addr?;
-        Some([addr.to_p2tr_script_pubkey().to_hex_string()])
+        Some(addr.to_p2tr_script_pubkey().to_hex_string())
     }
 
-    async fn collect_side(&mut self, side: u8) -> Result<()> {
-        let vtxo = txbuild::player_vtxo(&self.keys, &self.params)?;
-        let scripts = [vtxo.script_pubkey().to_hex_string()];
-        self.collect_side_scripts(side, &scripts).await
+    async fn collect_side(&mut self) -> Result<()> {
+        // While hosting, watch the game key's script (START lands there).
+        let scripts = [self.my_script_hex()];
+        self.collect_side_scripts(&scripts).await
     }
 
     /// Ingest new game txs visible on one side's scripts.
-    async fn collect_side_scripts(&mut self, _side: u8, scripts: &[String; 1]) -> Result<()> {
+    async fn collect_side_scripts(&mut self, scripts: &[String]) -> Result<()> {
         let mut records = Vec::new();
         for s in scripts {
             records.extend(self.rest.get_vtxos(s, "").await?);
@@ -553,6 +645,7 @@ impl MatchApp {
         };
         let my_pk = self.keys.owner_pk();
         let my_pk_bytes = my_pk.serialize();
+        let master_pk_bytes = self.master.owner_pk().serialize();
         for psbt in &txs {
             let tx = &psbt.unsigned_tx;
             let txid = tx.compute_txid();
@@ -561,15 +654,19 @@ impl MatchApp {
                 .iter()
                 .any(|o| ark_core::extension::is_extension(&o.script_pubkey));
             // Attribute by input ownership: the signer's x-only pubkey is in
-            // the PSBT's tap_script_sigs keys (and/or final witness). This
-            // survives reloads with no local state. Fall back to sent-txids.
-            let mine = psbt.inputs.iter().any(|inp| {
-                inp.tap_script_sigs.keys().any(|(pk, _)| pk == &my_pk)
-                    || inp.final_script_witness.as_ref().is_some_and(|w| {
-                        w.iter().any(|e| e.windows(32).any(|x| x == my_pk_bytes))
-                    })
-            });
-            let side = if mine || self.sent_txids.contains(&txid) { 0 } else { 1 };
+            // the PSBT's tap_script_sigs keys (and/or final witness). The
+            // master key also counts as "us" (game-key funding sends).
+            let signed_by = |pk: &[u8; 32]| {
+                psbt.inputs.iter().any(|inp| {
+                    inp.tap_script_sigs.keys().any(|(k, _)| k.serialize() == *pk)
+                        || inp.final_script_witness.as_ref().is_some_and(|w| {
+                            w.iter().any(|e| e.windows(32).any(|x| x == pk))
+                        })
+                })
+            };
+            let mine =
+                signed_by(&my_pk_bytes) || signed_by(&master_pk_bytes) || self.sent_txids.contains(&txid);
+            let side = if mine { 0 } else { 1 };
             for payload in payloads_from_tx(tx) {
                 let Some(msg) = Msg::decode(&payload) else { continue };
                 // Once a match is adopted, ignore stray messages for others.
@@ -609,15 +706,17 @@ impl MatchApp {
     async fn adopt_start(&mut self, tag: [u8; 8], joiner: ark_core::ArkAddress) -> Result<()> {
         self.match_tag = Some(tag);
         self.opponent_addr = Some(joiner);
-        // ACK carries the match start timestamp.
-        let start_ms = now_ms() + START_GRACE_MS;
+        if !self.ensure_game_funded().await? {
+            self.log_line("START received; funding game key before ACK");
+            return Ok(()); // retry on next poll
+        }
         let msg = Msg {
             match_tag: tag,
             seq: self.seq,
             prev: self.last_sent_tag,
             tick_ms: now_ms(),
             kind: Kind::Ack,
-            data: start_ms.to_le_bytes().to_vec(),
+            data: vec![],
         };
         let funding = self.chain_input().await?;
         let (ark_tx, checkpoints) = txbuild::build_message_tx(
@@ -631,14 +730,12 @@ impl MatchApp {
         )?;
         self.send_raw(ark_tx, checkpoints).await?;
         self.log_line("START received; ACK sent");
-        self.begin_match(start_ms).await
+        self.begin_match().await
     }
 
-    /// Joiner: find the host's ACK and read the match start timestamp.
-    /// Accepts ACKs for any START we ever sent (a failed first attempt may
-    /// have finalized on the server without our local state advancing), then
-    /// adopts the matched tag.
-    fn find_ack(&mut self) -> Option<u64> {
+    /// Joiner: the host's ACK for any START we ever sent (a crashed first
+    /// attempt may have finalized without our local state advancing).
+    fn find_ack(&mut self) -> bool {
         let mut candidates: Vec<[u8; 8]> = self.match_tag.into_iter().collect();
         let my_addr = self.my_address().encode();
         for e in &self.events {
@@ -656,24 +753,22 @@ impl MatchApp {
             if !candidates.contains(&e.msg.match_tag) {
                 continue;
             }
-            let bytes: [u8; 8] = e.msg.data.as_slice().try_into().ok()?;
             self.match_tag = Some(e.msg.match_tag);
-            return Some(u64::from_le_bytes(bytes));
+            return true;
         }
-        None
+        false
     }
 
-    async fn begin_match(&mut self, start_ms: u64) -> Result<()> {
-        let start_tick = start_ms / crate::game::TICK_MS;
-        self.sim = Some(Sim::new(start_tick));
+    async fn begin_match(&mut self) -> Result<()> {
+        self.sim = Some(Sim::new());
         self.phase = Phase::Arming;
-        self.log_line(format!("handshake complete; match starts at tick {start_tick}"));
+        self.log_line("handshake complete; arming…");
         Ok(())
     }
 
-    /// Rebuild sim inputs from the ordered log and advance to now.
-    async fn advance_sim(&mut self) -> Result<()> {
-        let Some(tag) = self.match_tag else { return Ok(()) };
+    /// Rebuild sim inputs from the ordered log and run them.
+    fn rebuild_sim_inputs(&self) -> Vec<Input> {
+        let Some(tag) = self.match_tag else { return Vec::new() };
         let events: Vec<Event> = self
             .events
             .iter()
@@ -683,27 +778,33 @@ impl MatchApp {
         let ordered = order_events(events);
         let mut inputs = Vec::new();
         for e in &ordered {
-            let tick = e.msg.tick_ms / crate::game::TICK_MS;
             match e.msg.kind {
-                Kind::Move if !e.msg.data.is_empty() => inputs.push(Input::Move {
-                    side: e.side as usize,
-                    tick,
-                    keys: e.msg.data[0],
-                }),
+                Kind::Move => {
+                    for &dir in &e.msg.data {
+                        inputs.push(Input::Move {
+                            side: e.side as usize,
+                            dir,
+                        });
+                    }
+                }
                 Kind::Fire => inputs.push(Input::Fire {
                     side: e.side as usize,
-                    tick,
                 }),
                 _ => {}
             }
         }
+        inputs
+    }
+
+    async fn advance_sim(&mut self) -> Result<()> {
+        if self.sim.is_none() {
+            return Ok(());
+        }
+        let inputs = self.rebuild_sim_inputs();
         self.sim_inputs = inputs.clone();
-        let Some(sim) = self.sim.take() else { return Ok(()) };
-        let start_tick = sim.start_tick;
-        let target = (now_ms() / crate::game::TICK_MS).max(start_tick);
         // Re-run from scratch: cheap at this scale, immune to late events.
-        let mut fresh = Sim::new(start_tick);
-        fresh.run(&inputs, target);
+        let mut fresh = Sim::new();
+        fresh.run(&inputs);
         if let SimPhase::Done { winner } = fresh.phase {
             if matches!(self.phase, Phase::Playing) {
                 self.phase = Phase::Done {
@@ -722,7 +823,13 @@ impl MatchApp {
         // sides replayed to the identical outcome.
         if let Phase::Done { winner, verified } = self.phase {
             if !verified {
-                let my_hash = sim_hash_of(&self.sim_inputs, start_tick);
+                let my_hash = Some(fresh.state_hash());
+                let ordered: Vec<Event> = self
+                    .events
+                    .iter()
+                    .filter(|e| Some(e.msg.match_tag) == self.match_tag)
+                    .cloned()
+                    .collect();
                 let opp_end_ok = ordered.iter().any(|e| {
                     e.side == 1
                         && e.msg.kind == Kind::End
@@ -743,7 +850,6 @@ impl MatchApp {
         Ok(())
     }
 
-    /// JSON snapshot for the JS UI.
     pub fn snapshot(&self, version: &str) -> Snapshot {
         let (players, bullets, ammo, sim_phase) = match &self.sim {
             Some(sim) => {
@@ -777,7 +883,8 @@ impl MatchApp {
             version: version.to_string(),
             phase: phase.to_string(),
             sim_phase: sim_phase.to_string(),
-            address: self.my_address().encode(),
+            address: self.funding_address().encode(),
+            game_address: self.in_match().then(|| self.my_address().encode()),
             opponent: self.opponent_addr.map(|a| a.encode()),
             match_id: self.match_tag.map(|t| hex8(&t)),
             players,
@@ -805,7 +912,10 @@ pub struct Snapshot {
     pub version: String,
     pub phase: String,
     pub sim_phase: String,
+    /// Master-key address: the funding target shown in the UI.
     pub address: String,
+    /// Per-match address (present while a match is active).
+    pub game_address: Option<String>,
     pub opponent: Option<String>,
     pub match_id: Option<String>,
     pub players: Option<[[i32; 2]; 2]>,
@@ -843,19 +953,25 @@ impl MatchApp {
         };
         serde_json::json!({
             "phase": phase,
+            "gameKey": self.game_key_hex(),
             "matchTag": self.match_tag.map(|t| hex8(&t)),
             "opponent": self.opponent_addr.map(|a| a.encode()),
             "myBulletAsset": self.my_bullet_asset.map(|a| a.to_string()),
             "seq": self.seq,
-            "startMs": self.sim.as_ref().map(|s| s.start_tick * crate::game::TICK_MS),
             "sent": self.sent_txids.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
         })
     }
 
     pub fn import_state(&mut self, v: &serde_json::Value) {
+        if let Some(key) = v.get("gameKey").and_then(|k| k.as_str()) {
+            if let Ok(keys) = Keys::from_hex(key) {
+                self.keys = keys;
+            }
+        }
         let phase = v.get("phase").and_then(|p| p.as_str()).unwrap_or("idle");
         self.phase = match phase {
             "hosting" => Phase::Hosting,
+            "join-funding" => Phase::JoinFunding,
             "join-sent" => Phase::JoinSent,
             "arming" => Phase::Arming,
             "playing" => Phase::Playing,
@@ -878,9 +994,6 @@ impl MatchApp {
         if let Some(seq) = v.get("seq").and_then(|s| s.as_u64()) {
             self.seq = seq as u32;
         }
-        if let Some(start_ms) = v.get("startMs").and_then(|s| s.as_u64()) {
-            self.sim = Some(Sim::new(start_ms / crate::game::TICK_MS));
-        }
         if let Some(sent) = v.get("sent").and_then(|s| s.as_array()) {
             for t in sent.iter().filter_map(|t| t.as_str()) {
                 if let Ok(txid) = t.parse() {
@@ -891,30 +1004,10 @@ impl MatchApp {
         if self.phase != Phase::Idle {
             self.log_line("restored match state from local storage");
         }
-    }
-}
-
-fn sim_hash_of(inputs: &[Input], start_tick: u64) -> Option<u64> {
-    let mut sim = Sim::new(start_tick);
-    sim.run(inputs, now_ms() / crate::game::TICK_MS);
-    match sim.phase {
-        SimPhase::Done { .. } => Some(sim.state_hash()),
-        SimPhase::Playing => None,
-    }
-}
-
-/// Wall-clock unix milliseconds (browser clock).
-pub fn now_ms() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        (js_sys::Date::now() as u64)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
+        // A restored in-progress match gets a fresh sim; the log replays it.
+        if matches!(self.phase, Phase::Arming | Phase::Playing) {
+            self.sim = Some(Sim::new());
+        }
     }
 }
 
@@ -934,15 +1027,31 @@ pub fn extract_spent_outpoint(text: &str) -> Option<String> {
     }
 }
 
+/// Wall-clock unix milliseconds (browser clock).
+pub fn now_ms() -> u64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn extracts_spent_outpoint() {
-        let body = r#"POST /v1/tx/submit failed (400): {"code":3,"message":"af4c...01:0 already spent","details":[]}"#;
-        // use a realistic-looking outpoint
         let txid = "a".repeat(64);
         let body = format!("submit failed (400): {{\"message\":\"{txid}:2 already spent\"}}");
-        assert_eq!(super::extract_spent_outpoint(&body).as_deref(), Some(format!("{txid}:2").as_str()));
+        assert_eq!(
+            super::extract_spent_outpoint(&body).as_deref(),
+            Some(format!("{txid}:2").as_str())
+        );
         assert_eq!(super::extract_spent_outpoint("some other error"), None);
     }
 }

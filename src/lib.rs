@@ -23,7 +23,7 @@ use wasm_bindgen::prelude::*;
 const STORAGE_KEY: &str = "arkade-duel:key";
 const STORAGE_STATE: &str = "arkade-duel:match";
 /// Bumped on every deploy; shown in the UI so stale caches are obvious.
-pub const VERSION: &str = "0.2.8";
+pub const VERSION: &str = "0.3.0";
 /// Public Arkade mainnet operator. Override with `?server=https://…`
 /// (e.g. https://mutinynet.arkade.sh for testing).
 const DEFAULT_SERVER: &str = "https://arkade.computer";
@@ -95,7 +95,7 @@ impl App {
 
     #[wasm_bindgen(js_name = address)]
     pub fn address(&self) -> String {
-        self.inner.my_address().encode()
+        self.inner.funding_address().encode()
     }
 
     /// "mainnet" or "signet" — known right after init, before any snapshot.
@@ -116,7 +116,8 @@ impl App {
     /// The single serialized entry point.
     ///
     /// * `command`: "", "host", "join" (`arg` = host address), or "reset"
-    /// * `mask`: current WASD key bitmask (see `keyMask`)
+    /// * `dirs`: direction presses since the previous step (0=up 1=right
+    ///   2=down 3=left) — each becomes one discrete step on-chain
     /// * `fires`: number of fire presses since the previous step
     ///
     /// Returns the JSON snapshot for rendering.
@@ -125,7 +126,7 @@ impl App {
         &mut self,
         command: &str,
         arg: &str,
-        mask: u8,
+        dirs: Vec<u8>,
         fires: u32,
     ) -> Result<JsValue, JsValue> {
         if command == "reset" {
@@ -138,7 +139,7 @@ impl App {
             // Persist immediately after state-changing commands: a reload
             // during the following poll must not lose a sent START.
             self.persist();
-            self.inner.step(mask, fires).await.map_err(js_err)?;
+            self.inner.step(&dirs, fires).await.map_err(js_err)?;
         }
         self.persist();
         serde_wasm_bindgen::to_value(&self.inner.snapshot(VERSION))
@@ -146,13 +147,7 @@ impl App {
     }
 }
 
-#[wasm_bindgen(js_name = keyMask)]
-pub fn key_mask(w: bool, a: bool, s: bool, d: bool) -> u8 {
-    (if w { game::KEY_W } else { 0 })
-        | (if a { game::KEY_A } else { 0 })
-        | (if s { game::KEY_S } else { 0 })
-        | (if d { game::KEY_D } else { 0 })
-}
+
 
 /// Convenience for examples/tools: this player's Arkade address.
 pub fn my_address(keys: &Keys, params: &ServerParams) -> String {
@@ -164,7 +159,6 @@ pub fn my_address(keys: &Keys, params: &ServerParams) -> String {
 
 /// Convenience for examples/tools: this player's VTXO script hex.
 pub fn my_script_hex(keys: &Keys, params: &ServerParams) -> String {
-    use bitcoin::hex::DisplayHex;
     txbuild::player_vtxo(keys, params)
         .expect("vtxo")
         .script_pubkey()
@@ -197,7 +191,7 @@ pub fn build_test_payload(
         prev: [0; 8],
         tick_ms: match_::now_ms(),
         kind: gamelog::Kind::Move,
-        data: vec![game::KEY_D],
+        data: vec![game::DIR_RIGHT],
     }
     .encode())
 }

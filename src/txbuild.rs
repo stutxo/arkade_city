@@ -281,6 +281,37 @@ pub fn build_message_tx(
     Ok((txs.ark_tx, txs.checkpoint_txs))
 }
 
+/// Plain value send with no OP_RETURN (game-key funding).
+pub fn build_send_tx(
+    keys: &Keys,
+    params: &ServerParams,
+    info: &server::Info,
+    inputs: &[VtxoRecord],
+    recipient: ark_core::ArkAddress,
+    amount_sats: u64,
+) -> Result<(Psbt, Vec<Psbt>)> {
+    let vtxo = player_vtxo(keys, params)?;
+    let own_address = vtxo.to_ark_address();
+    let inputs: Vec<_> = inputs
+        .iter()
+        .map(|r| vtxo_input(r, &vtxo))
+        .collect::<Result<_>>()?;
+    let total_in: u64 = inputs.iter().map(|i| i.amount().to_sat()).sum();
+    let mut amount = amount_sats;
+    if let Some(change) = total_in.checked_sub(amount) {
+        if change > 0 && change < params.dust_sats {
+            amount = total_in;
+        }
+    }
+    let receivers = [ark_core::send::SendReceiver::bitcoin(
+        recipient,
+        Amount::from_sat(amount),
+    )];
+    let txs = build_offchain_transactions(&receivers, &own_address, &inputs, info)
+        .map_err(|e| anyhow!("build send tx: {e}"))?;
+    Ok((txs.ark_tx, txs.checkpoint_txs))
+}
+
 /// Self-issue `amount` units of a fresh asset. Returns the derived asset ID.
 pub fn build_issue_tx(
     keys: &Keys,
