@@ -34,4 +34,4 @@ cp pkg/README.md README.md
 rm -f pkg/.gitignore
 node --input-type=module -e 'import fs from "node:fs"; const path = "pkg/package.json"; const pkg = JSON.parse(fs.readFileSync(path, "utf8")); pkg.private = true; fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);'
 
-echo "built Arkade Maze: pkg/arkade_duel.js + pkg/arkade_duel_bg.wasm"
+echo "built Arkade City: pkg/arkade_city.js + pkg/arkade_city_bg.wasm"

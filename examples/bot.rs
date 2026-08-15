@@ -1,11 +1,11 @@
-//! Native headless Arkade Maze player and asset-preserving wallet sweep tool.
+//! Native headless Arkade City player and asset-preserving wallet sweep tool.
 //!
 //!   cargo run --example bot -- play
 //!   cargo run --example bot -- sweep <destination_ark_address> <key_hex>...
 
 use anyhow::{Context, Result};
-use arkade_duel::match_::{GameApp, Phase};
-use arkade_duel::{game, txbuild, ArkadeRest, Keys, ServerParams};
+use arkade_city::match_::{GameApp, Phase};
+use arkade_city::{game, txbuild, ArkadeRest, Keys, ServerParams};
 
 const SERVER: &str = "https://mutinynet.arkade.sh";
 const KEY_PATH: &str = ".arkade-maze-bot-key";
@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     match mode {
         "play" => {
             let keys = load_or_create_key()?;
-            println!("player wallet: {}", arkade_duel::my_address(&keys, &params));
+            println!("player wallet: {}", arkade_city::my_address(&keys, &params));
             play(keys, rest, params).await
         }
         "sweep" => {
@@ -121,7 +121,7 @@ async fn sweep(
     for key_hex in key_hexes {
         let keys = Keys::from_hex(key_hex)?;
         let records = rest
-            .get_vtxos(&arkade_duel::my_script_hex(&keys, params), "spendableOnly")
+            .get_vtxos(&arkade_city::my_script_hex(&keys, params), "spendableOnly")
             .await?;
         let total: u64 = records.iter().map(|record| record.amount_sats).sum();
         if total == 0 {

@@ -1,8 +1,7 @@
 # Design: Registry And Burn Chains
 
-Status: implemented alpha. Native tests, release WASM, live-network smoke
-tests, and the funded reload/replay/sweep regtest pass. The public build is
-currently pinned to Mutinynet.
+Status: implemented alpha. Native tests, release WASM, and live Mutinynet
+smoke tests pass. The public build is pinned to Mutinynet.
 
 ## Goal
 
@@ -61,6 +60,9 @@ anchor: final output
 ```
 
 The packet creates four immutable groups on output one:
+
+The legacy `arkade-maze-v2` protocol identifier remains immutable so Arkade
+City continues to discover and replay transactions created before the rename.
 
 ```text
 group 0: game=arkade-maze-v2, move=w, amount=50

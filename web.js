@@ -1,4 +1,4 @@
-import init, { App } from './pkg/arkade_duel.js?v=2.0.0';
+import init, { App } from './pkg/arkade_city.js?v=2.0.0';
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -286,9 +286,6 @@ function applySnapshot(state) {
   if (state.network === 'mutinynet') {
     text('faucet-note', `Use "Send to Arkade" at https://faucet.mutinynet.com for ${state.address}; do not use its on-chain address field.`);
     show('faucet-note');
-  } else if (state.network === 'regtest') {
-    text('faucet-note', `Local funding: ./scripts/regtest.sh fund ${state.address} 1000`);
-    show('faucet-note');
   } else {
     hide('faucet-note');
   }
@@ -384,5 +381,5 @@ async function boot() {
 boot().catch((error) => {
   text('phase', 'BOOT FAILED');
   text('boot-stage', 'not connected');
-  showError(`Could not start Arkade Maze: ${String(error)}`);
+  showError(`Could not start Arkade City: ${String(error)}`);
 });

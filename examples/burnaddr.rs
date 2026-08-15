@@ -1,8 +1,8 @@
 //! Recompute the game's NUMS-owned registry address from operator params.
 
 use anyhow::Result;
-use arkade_duel::match_::{nums_registry_address, GAME_ADDRESS};
-use arkade_duel::{ArkadeRest, MUTINYNET_SERVER};
+use arkade_city::match_::{nums_registry_address, GAME_ADDRESS};
+use arkade_city::{ArkadeRest, MUTINYNET_SERVER};
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -165,7 +165,7 @@ impl GameApp {
             ));
         }
         if params.network_name != "mutinynet" {
-            return Err(anyhow!("Arkade Maze currently supports Mutinynet only"));
+            return Err(anyhow!("Arkade City currently supports Mutinynet only"));
         }
         let game_address = nums_registry_address(&params)?;
         if game_address.encode() != GAME_ADDRESS {

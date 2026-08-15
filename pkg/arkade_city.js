@@ -1,4 +1,4 @@
-/* @ts-self-types="./arkade_duel.d.ts" */
+/* @ts-self-types="./arkade_city.d.ts" */
 
 export class App {
     static __wrap(ptr) {
@@ -496,7 +496,7 @@ function __wbg_get_imports() {
     };
     return {
         __proto__: null,
-        "./arkade_duel_bg.js": import0,
+        "./arkade_city_bg.js": import0,
     };
 }
 
@@ -839,7 +839,7 @@ async function __wbg_init(module_or_path) {
     }
 
     if (module_or_path === undefined) {
-        module_or_path = new URL('arkade_duel_bg.wasm', import.meta.url);
+        module_or_path = new URL('arkade_city_bg.wasm', import.meta.url);
     }
     const imports = __wbg_get_imports();
 

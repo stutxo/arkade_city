@@ -1,8 +1,8 @@
 //! Build synthetic registration and protocol-burn transactions and print them.
 
 use anyhow::Result;
-use arkade_duel::match_::GAME_ADDRESS;
-use arkade_duel::{gamelog, txbuild, ArkadeRest, Keys, VtxoRecord, MUTINYNET_SERVER};
+use arkade_city::match_::GAME_ADDRESS;
+use arkade_city::{gamelog, txbuild, ArkadeRest, Keys, VtxoRecord, MUTINYNET_SERVER};
 
 #[tokio::main]
 async fn main() -> Result<()> {

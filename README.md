@@ -1,10 +1,10 @@
-# Arkade Maze
+# Arkade City
 
-Arkade Maze is an endless multiplayer map reconstructed entirely from Arkade
+Arkade City is an endless multiplayer map reconstructed entirely from Arkade
 transactions. Every browser runs the same static Rust/WASM app. There are no
 matches, peers, relays, game servers, or operator changes.
 
-Play the Mutinynet build at <https://stutxo.github.io/arkade_game/>.
+Play the Mutinynet build at <https://stutxo.github.io/arkade_city/>.
 
 ```text
 player browsers
@@ -59,20 +59,31 @@ carrier. A move does not transfer sats to the registry. The carrier remains in
 the player's wallet across all 200 moves and can be recovered afterward,
 subject to Arkade expiry and any future operator fees.
 
-Registration inputs must total exactly 660 sats or leave change at least as
-large as the operator's VTXO minimum. For example, one 700-sat VTXO would leave
-rejected 40-sat change, so the UI asks for another 330-sat VTXO instead of
-submitting an invalid transaction.
+Registration inputs must total exactly 660 sats or leave change accepted by
+the operator's VTXO minimum. Mutinynet permits one-sat VTXOs, so change below
+330 sats is encoded as a recoverable sub-dust output. Prefer funding amounts
+that leave at least 330 sats of change when possible.
 
 The wallet key and pending-transaction journal are stored in `localStorage`.
-A recovery bundle with the raw key, address, signer, and exit delay is also
-shown in the UI. Use "Forget wallet" only after recovering or sweeping any
-remaining funds.
+A recovery bundle with the raw key, address, signer, exit delay, and pending
+journal is also shown in the UI. Use "Forget wallet" only after recovering or
+sweeping any remaining funds. Browser storage is plaintext origin storage, so
+treat the browser profile and every script served on the same origin as
+wallet-sensitive.
+
+Transactions cross a durable boundary before submission. Rust first signs the
+exact Ark and checkpoint PSBTs locally. `web.js` writes and verifies that
+journal in browser storage; only the following tick may query
+`/v1/tx/pending`, submit, or finalize it. Reloading during registration, a move,
+or a sweep therefore retries the same txid instead of rebuilding it.
 
 ## Registration Protocol
 
 Each player's four immutable assets share one issuance txid, which is also the
 player ID. Group indexes are:
+
+The on-chain `arkade-maze-v2` identifier is retained so the renamed app can
+continue replaying existing registrations and moves.
 
 | Group | Asset metadata | Direction |
 | --- | --- | --- |
@@ -124,8 +135,9 @@ A fresh client performs two existing indexer queries:
 
 1. Paginate every VTXO for the registry script and validate registration
    transactions.
-2. Query the discovered player scripts in batches, fetch each creating virtual
-   transaction, and accept only canonical one-unit burns.
+2. Query the discovered player scripts in batches using repeated `scripts`
+   query parameters, fetch each creating virtual transaction, and accept only
+   canonical one-unit burns.
 
 This provides complete historical replay without an asset-event endpoint.
 Unresolved transaction fetches are retried. Active clients stop pagination at
@@ -147,11 +159,16 @@ python3 -m http.server 8000
 Open `http://localhost:8000`. All copies use the same hard-coded Mutinynet
 operator and registry.
 
+To fund the displayed `tark1...` address, open
+`https://faucet.mutinynet.com` and use its separate **Send to Arkade** form.
+Do not paste an Arkade address into the faucet's on-chain destination field.
+
 ## Tests
 
 ```sh
 cargo test --lib
 cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
 cargo run --example layout
 cargo run --example smoke
 ./build.sh
@@ -161,8 +178,8 @@ cargo run --example smoke
 
 | Path | Purpose |
 | --- | --- |
-| `src/lib.rs` | WASM API and fresh-wallet initialization |
-| `src/match_.rs` | registry polling, player-script polling, lifecycle, and replay |
+| `src/lib.rs` | Mutinynet-pinned WASM API, restoration, and journal export |
+| `src/match_.rs` | durable wallet actions, registry polling, lifecycle, and replay |
 | `src/game.rs` | deterministic square maze and endless lap rules |
 | `src/gamelog.rs` | registration, burn, receipt, and sequence validation |
 | `src/txbuild.rs` | registration issuance, protocol burns, signing, and finalization |
@@ -185,3 +202,6 @@ cargo run --example smoke
   `/v1/tx/pending` ownership proof and the identical transaction is resubmitted
   only when no pending copy exists. The browser persists the pending journal so
   a reload can resume recovery or finalization.
+- Sweep sends every safely collaborative-spendable sat and asset to another
+  Mutinynet Arkade address. Boarding, settlement, renewal, unilateral exit, and
+  recovery of swept or sub-dust VTXOs still require a full Arkade wallet.

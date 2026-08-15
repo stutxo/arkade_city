@@ -1,4 +1,4 @@
-//! Arkade Maze: one player registry and indexable asset-burn move chains.
+//! Arkade City: one player registry and indexable asset-burn move chains.
 
 pub mod arkade;
 pub mod game;
@@ -38,7 +38,7 @@ impl App {
         console_error_panic_hook::set_once();
         if server.trim_end_matches('/') != MUTINYNET_SERVER {
             return Err(JsValue::from_str(
-                "Arkade Maze currently supports Mutinynet only",
+                "Arkade City currently supports Mutinynet only",
             ));
         }
         let rest = ArkadeRest::new(MUTINYNET_SERVER);

@@ -1,5 +1,5 @@
 [package]
-name = "arkade-maze"
+name = "arkade-city"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.86"
@@ -10,7 +10,7 @@ license = "MIT"
 wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 
 [lib]
-name = "arkade_duel"
+name = "arkade_city"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
