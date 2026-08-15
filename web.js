@@ -1,4 +1,4 @@
-import init, { App, keyMask } from './pkg/arkade_duel.js?v=0.2.4';
+import init, { App, keyMask } from './pkg/arkade_duel.js?v=0.2.5';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -179,8 +179,8 @@ function render() {
 
   if (lastSnapshot && lastSnapshot.players) {
     const [me, opp] = lastSnapshot.players;
-    drawStick(ctx, opp.x, opp.y, '#e25563');   // opponent
-    drawStick(ctx, me.x, me.y, '#6fd3ff');     // us
+    drawStick(ctx, opp[0], opp[1], '#e25563');   // opponent
+    drawStick(ctx, me[0], me[1], '#6fd3ff');     // us
     ctx.fillStyle = '#ffd166';
     for (const [x, y] of lastSnapshot.bullets || []) {
       ctx.fillRect(x - 2, y - 2, 4, 4);

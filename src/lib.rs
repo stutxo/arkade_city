@@ -23,7 +23,7 @@ use wasm_bindgen::prelude::*;
 const STORAGE_KEY: &str = "arkade-duel:key";
 const STORAGE_STATE: &str = "arkade-duel:match";
 /// Bumped on every deploy; shown in the UI so stale caches are obvious.
-pub const VERSION: &str = "0.2.4";
+pub const VERSION: &str = "0.2.5";
 /// Public Arkade mainnet operator. Override with `?server=https://…`
 /// (e.g. https://mutinynet.arkade.sh for testing).
 const DEFAULT_SERVER: &str = "https://arkade.computer";
@@ -141,9 +141,7 @@ impl App {
             self.inner.step(mask, fires).await.map_err(js_err)?;
         }
         self.persist();
-        let mut snapshot = self.inner.snapshot();
-        snapshot["version"] = serde_json::json!(VERSION);
-        serde_wasm_bindgen::to_value(&snapshot)
+        serde_wasm_bindgen::to_value(&self.inner.snapshot(VERSION))
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }

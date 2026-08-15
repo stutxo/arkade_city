@@ -723,15 +723,15 @@ impl MatchApp {
     }
 
     /// JSON snapshot for the JS UI.
-    pub fn snapshot(&self) -> serde_json::Value {
-        let (sim_pos, bullets, ammo, sim_phase) = match &self.sim {
+    pub fn snapshot(&self, version: &str) -> Snapshot {
+        let (players, bullets, ammo, sim_phase) = match &self.sim {
             Some(sim) => {
                 let phase = match sim.phase {
                     SimPhase::Playing => "playing",
                     SimPhase::Done { .. } => "done",
                 };
                 (
-                    Some(sim.pos),
+                    Some(sim.pos.map(|(x, y)| [x, y])),
                     sim.bullets.iter().map(|b| [b.x, b.y]).collect::<Vec<_>>(),
                     Some(sim.ammo),
                     phase,
@@ -748,29 +748,56 @@ impl MatchApp {
             Phase::Playing => ("playing", None, false),
             Phase::Done { winner, verified } => ("done", Some(winner), verified),
         };
-        serde_json::json!({
-            "network": match self.params.network {
-                bitcoin::Network::Bitcoin => "mainnet",
-                _ => "signet",
+        Snapshot {
+            network: match self.params.network {
+                bitcoin::Network::Bitcoin => "mainnet".to_string(),
+                _ => "signet".to_string(),
             },
-            "phase": phase,
-            "simPhase": sim_phase,
-            "address": self.my_address().encode(),
-            "opponent": self.opponent_addr.map(|a| a.encode()),
-            "matchId": self.match_tag.map(|t| hex8(&t)),
-            "players": sim_pos.map(|p| [ serde_json::json!({ "x": p[0].0, "y": p[0].1 }), serde_json::json!({ "x": p[1].0, "y": p[1].1 }) ]),
-            "bullets": bullets,
-            "ammo": ammo,
-            "winner": winner,
-            "verified": verified,
-            "myBulletAsset": self.my_bullet_asset.map(|a| a.to_string()),
-            "sending": self.sending,
-            "balance": self.balance_cache,
-            "events": self.events.len(),
-            "lastSyncMs": self.last_sync_ms,
-            "log": self.log,
-        })
+            version: version.to_string(),
+            phase: phase.to_string(),
+            sim_phase: sim_phase.to_string(),
+            address: self.my_address().encode(),
+            opponent: self.opponent_addr.map(|a| a.encode()),
+            match_id: self.match_tag.map(|t| hex8(&t)),
+            players,
+            bullets,
+            ammo,
+            winner,
+            verified,
+            my_bullet_asset: self.my_bullet_asset.map(|a| a.to_string()),
+            sending: self.sending,
+            balance: self.balance_cache,
+            events: self.events.len() as u32,
+            last_sync_ms: self.last_sync_ms,
+            log: self.log.clone(),
+        }
     }
+}
+
+/// UI snapshot. Plain serde struct so serde-wasm-bindgen produces a real JS
+/// object (serializing a serde_json::Value yields a JS Map instead — every
+/// field reads as undefined).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Snapshot {
+    pub network: String,
+    pub version: String,
+    pub phase: String,
+    pub sim_phase: String,
+    pub address: String,
+    pub opponent: Option<String>,
+    pub match_id: Option<String>,
+    pub players: Option<[[i32; 2]; 2]>,
+    pub bullets: Vec<[i32; 2]>,
+    pub ammo: Option<[u32; 2]>,
+    pub winner: Option<usize>,
+    pub verified: bool,
+    pub my_bullet_asset: Option<String>,
+    pub sending: bool,
+    pub balance: u64,
+    pub events: u32,
+    pub last_sync_ms: u64,
+    pub log: Vec<String>,
 }
 
 pub fn hex8(tag: &[u8; 8]) -> String {
