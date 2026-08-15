@@ -23,7 +23,7 @@ use wasm_bindgen::prelude::*;
 const STORAGE_KEY: &str = "arkade-duel:key";
 const STORAGE_STATE: &str = "arkade-duel:match";
 /// Bumped on every deploy; shown in the UI so stale caches are obvious.
-pub const VERSION: &str = "0.2.7";
+pub const VERSION: &str = "0.2.8";
 /// Public Arkade mainnet operator. Override with `?server=https://…`
 /// (e.g. https://mutinynet.arkade.sh for testing).
 const DEFAULT_SERVER: &str = "https://arkade.computer";

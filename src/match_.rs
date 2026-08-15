@@ -395,7 +395,9 @@ impl MatchApp {
             self.log_line("out of ammo (no bullet asset VTXO)");
             return Ok(());
         };
-        let msg = self.next_msg(Kind::Fire, vec![]);
+        // weapon id 0 = standard bullet; the byte also keeps the payload
+        // off the 32-byte sub-dust VTXO script shape.
+        let msg = self.next_msg(Kind::Fire, vec![0]);
         let (ark_tx, checkpoints) = txbuild::build_burn_tx(
             &self.keys,
             &self.params,

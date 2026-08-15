@@ -92,12 +92,21 @@ pub fn vtxo_input(record: &VtxoRecord, vtxo: &Vtxo) -> Result<ark_core::send::Vt
 }
 
 fn parse_asset_id(s: &str) -> Option<(Txid, u16)> {
+    parse_asset_id_pub(s).map(|a| (a.txid, a.group_index))
+}
+
+/// Public for examples/tests.
+pub fn parse_asset_id_pub(s: &str) -> Option<ark_core::asset::AssetId> {
+    parse_asset_id_inner(s)
+}
+
+fn parse_asset_id_inner(s: &str) -> Option<ark_core::asset::AssetId> {
     if s.len() != 68 {
         return None;
     }
     let txid = Txid::from_str(&s[..64]).ok()?;
     let bytes: [u8; 2] = bitcoin::hex::FromHex::from_hex(&s[64..]).ok()?;
-    Some((txid, u16::from_le_bytes(bytes)))
+    Some(ark_core::asset::AssetId { txid, group_index: u16::from_le_bytes(bytes) })
 }
 
 /// Build a plain (non-extension) OP_RETURN output: `OP_RETURN <payload>`.

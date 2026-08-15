@@ -195,6 +195,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn no_kind_encodes_to_subdust_length() {
+        // 32-byte payloads collide with the operator's sub-dust VTXO script
+        // shape (OP_RETURN + 32-byte key). Every kind must avoid it.
+        for kind in [Kind::Start, Kind::Ack, Kind::Move, Kind::Fire, Kind::End] {
+            let data = match kind {
+                Kind::Start => b"tark1qexample".to_vec(),
+                Kind::Ack => 0u64.to_le_bytes().to_vec(),
+                Kind::Move => vec![0u8],
+                Kind::Fire => vec![0u8],
+                Kind::End => 0u64.to_le_bytes().to_vec(),
+            };
+            let msg = Msg {
+                match_tag: [0; 8],
+                seq: 0,
+                prev: [0; 8],
+                tick_ms: 0,
+                kind,
+                data,
+            };
+            assert_ne!(msg.encode().len(), 32, "{kind:?} encodes to 32 bytes");
+        }
+    }
+
+    #[test]
     fn msg_roundtrip() {
         let msg = Msg {
             match_tag: [1, 2, 3, 4, 5, 6, 7, 8],
