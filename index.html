@@ -3,63 +3,117 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Arkade Duel</title>
+  <meta name="theme-color" content="#111111">
+  <title>Arkade Maze</title>
   <link rel="stylesheet" href="game.css">
 </head>
 <body>
-  <main>
-    <h1>ARKADE DUEL <span id="version" class="ver"></span></h1>
-    <p class="tagline">serverless 1v1 &middot; every move is an Arkade transaction</p>
+  <header>
+    <h1>Arkade Maze <small id="version"></small></h1>
+    <strong id="phase">LOADING WASM</strong>
+  </header>
 
-    <section id="wallet">
-      <div class="row"><span class="label">your address</span>
-        <code id="address">…</code>
-        <button id="copy-addr" class="mini">copy</button>
+  <section class="bar" aria-label="Arkade connection">
+    <strong>Mutinynet</strong>
+    <code class="grow">https://mutinynet.arkade.sh</code>
+    <button id="connect">Reconnect</button>
+    <span id="boot-stage">loading</span>
+  </section>
+
+  <p id="boot-error" class="error hidden"></p>
+
+  <main id="app" class="hidden">
+    <div class="columns">
+      <section>
+        <h2>Wallet</h2>
+        <dl>
+          <dt>Network</dt><dd id="network">-</dd>
+          <dt>Operator</dt><dd><code id="operator">-</code></dd>
+          <dt>Wallet action</dt><dd id="wallet-action">-</dd>
+          <dt>Spendable</dt><dd id="balance">0 sats</dd>
+          <dt>Known total</dt><dd id="known-balance">0 sats</dd>
+          <dt>Pending tx</dt><dd><code id="pending-tx">none</code></dd>
+        </dl>
+
+        <label>Receive address</label>
+        <div class="copy-row">
+          <code id="wallet-address">-</code>
+          <button id="copy-wallet">Copy</button>
+        </div>
+        <p id="funding-note" class="notice"></p>
+        <p id="faucet-note" class="notice hidden"></p>
+
+        <h3>Send everything</h3>
+        <p class="small">Sweeps every safely spendable sat and asset. Move assets will no longer be playable after sending them to another wallet.</p>
+        <div class="action-row">
+          <input id="sweep-address" class="grow" placeholder="destination ark1... or tark1..." spellcheck="false">
+          <button id="sweep-all">Sweep all</button>
+        </div>
+
+        <details open>
+          <summary>Recovery and key import</summary>
+          <label>Current recovery bundle</label>
+          <textarea id="recovery-key" readonly></textarea>
+          <button id="copy-recovery">Copy recovery</button>
+          <label>Import a 64-character secret key or recovery JSON</label>
+          <textarea id="import-key" placeholder="secret key or recovery JSON"></textarea>
+          <div class="action-row">
+            <button id="import-wallet">Import and reload</button>
+            <button id="forget-wallet" class="danger">Forget wallet</button>
+          </div>
+        </details>
+      </section>
+
+      <section>
+        <h2>Game protocol</h2>
+        <dl>
+          <dt>Registry</dt><dd><code id="game-address">-</code></dd>
+          <dt>Player ID</dt><dd><code id="player-id">not registered</code></dd>
+          <dt>Players</dt><dd id="player-count">0</dd>
+          <dt>Accepted moves</dt><dd id="event-count">0</dd>
+          <dt>Game sync</dt><dd id="sync">never</dd>
+          <dt>Wallet sync</dt><dd id="wallet-sync">never</dd>
+        </dl>
+
+        <div class="assets" aria-label="Move asset balances">
+          <span>W <b id="asset-w">0</b></span>
+          <span>A <b id="asset-a">0</b></span>
+          <span>S <b id="asset-s">0</b></span>
+          <span>D <b id="asset-d">0</b></span>
+        </div>
+
+        <div class="game-head">
+          <strong id="board-status">waiting</strong>
+          <span><span id="queue-count">0</span> queued</span>
+        </div>
+        <canvas id="canvas" width="520" height="520" aria-label="Shared Arkade maze"></canvas>
+        <div class="controls" aria-label="Movement controls">
+          <button data-dir="0">W</button>
+          <button data-dir="3">A</button>
+          <button data-dir="2">S</button>
+          <button data-dir="1">D</button>
+        </div>
+      </section>
+    </div>
+
+    <section>
+      <h2>Wallet VTXOs</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Outpoint</th><th>Sats</th><th>Status</th><th>Expires</th><th>Assets</th><th>Spent by</th></tr></thead>
+          <tbody id="vtxos"><tr><td colspan="6">none</td></tr></tbody>
+        </table>
       </div>
-      <div class="row"><span class="label">balance</span><code id="balance">…</code></div>
-      <div class="row"><span class="label">network</span>
-        <span id="net-badge" class="badge">…</span>
-        <button id="net-btn" class="mini">switch to signet</button>
-      </div>
-      <div id="net-warn" class="warn hidden"></div>
-      <details>
-        <summary>recovery key</summary>
-        <code id="recovery-key" class="secret"></code>
-        <p class="warn">MAINNET — real bitcoin. Anyone with this key can spend the wallet. Keep tiny amounts only.</p>
-      </details>
     </section>
 
-    <section id="home">
-      <button id="host-btn">HOST NEW GAME</button>
-      <div id="host-link-row" class="hidden">
-        <span class="label">send this link</span>
-        <code id="host-link"></code>
-        <button id="copy-link" class="mini">copy</button>
-      </div>
-      <div id="join-row" class="hidden">
-        <p>challenge from <code id="join-addr"></code></p>
-        <button id="join-btn">ACCEPT &amp; SEND START TX</button>
-      </div>
-    </section>
-
-    <section id="arena" class="hidden">
-      <canvas id="canvas" width="800" height="450"></canvas>
-      <p class="hint">each keypress is one on-chain step &middot; SPACE fires &middot; one hit wins</p>
-    </section>
-
-    <section id="status">
-      <div class="row"><span class="label">phase</span><code id="phase">idle</code></div>
-      <div class="row"><span class="label">match</span><code id="match-id">—</code></div>
-      <div class="row"><span class="label">chain sync</span><code id="sync">never</code></div>
-      <button id="reset-btn" class="mini">reset match state</button>
-      <div id="result" class="hidden"></div>
-    </section>
-
-    <section id="log-wrap">
-      <h2>chain log</h2>
-      <ul id="log"></ul>
+    <section>
+      <h2>Last error</h2>
+      <pre id="last-error">none</pre>
+      <h2>Activity log</h2>
+      <pre id="log">waiting for first state</pre>
     </section>
   </main>
+
   <script type="module" src="web.js"></script>
 </body>
 </html>

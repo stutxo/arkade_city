@@ -30,7 +30,8 @@ fi
 echo "using CC_wasm32_unknown_unknown=$CC_wasm32_unknown_unknown"
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
 wasm-pack build --target web --release
+cp pkg/README.md README.md
 rm -f pkg/.gitignore
 node --input-type=module -e 'import fs from "node:fs"; const path = "pkg/package.json"; const pkg = JSON.parse(fs.readFileSync(path, "utf8")); pkg.private = true; fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);'
 
-echo "built pkg/arkade_duel.js + pkg/arkade_duel_bg.wasm"
+echo "built Arkade Maze: pkg/arkade_duel.js + pkg/arkade_duel_bg.wasm"

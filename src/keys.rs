@@ -1,7 +1,8 @@
-//! Browser-held Arkade identity: a single secp256k1 keypair.
+//! Browser-held Arkade identity.
 //!
-//! The key is generated from browser randomness and persisted in localStorage
-//! as hex. Mutinynet funds only — revisit before mainnet.
+//! The key type is storage-agnostic. The WASM API accepts an existing secret,
+//! while the browser persists one wallet per canonical Arkade server and
+//! exposes a recovery bundle.
 
 use anyhow::{anyhow, Context, Result};
 use bitcoin::key::Secp256k1;
@@ -30,14 +31,17 @@ impl Keys {
         let bytes: [u8; 32] = bitcoin::hex::FromHex::from_hex(secret_hex)
             .map_err(|e| anyhow!("invalid key hex: {e}"))?;
         let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &bytes)
-            .context("invalid secret key bytes")?;
+        let keypair =
+            Keypair::from_seckey_slice(&secp, &bytes).context("invalid secret key bytes")?;
         Ok(Self { secp, keypair })
     }
 
     pub fn secret_hex(&self) -> String {
         use bitcoin::hex::DisplayHex;
-        self.keypair.secret_key().secret_bytes().to_lower_hex_string()
+        self.keypair
+            .secret_key()
+            .secret_bytes()
+            .to_lower_hex_string()
     }
 
     pub fn owner_pk(&self) -> XOnlyPublicKey {

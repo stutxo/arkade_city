@@ -14,6 +14,8 @@ use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::JsFuture;
 
+const REQUEST_TIMEOUT_MS: i32 = 15_000;
+
 #[cfg(target_arch = "wasm32")]
 macro_rules! web_log {
     ($($t:tt)*) => {
@@ -29,8 +31,11 @@ macro_rules! web_log {
 
 #[derive(Clone, Debug)]
 pub struct ServerParams {
+    pub server_version: String,
     pub signer_pk: XOnlyPublicKey,
+    pub forfeit_pk: bitcoin::PublicKey,
     pub network: bitcoin::Network,
+    pub network_name: String,
     pub dust_sats: u64,
     pub vtxo_min_sats: u64,
     pub unilateral_exit_delay: bitcoin::Sequence,
@@ -48,10 +53,22 @@ pub struct VtxoRecord {
     pub assets: Vec<(String, u64)>,
     pub is_spent: bool,
     pub is_preconfirmed: bool,
-    /// Txid of the virtual tx that created this VTXO.
+    pub is_swept: bool,
+    pub is_unrolled: bool,
+    pub expires_at: Option<i64>,
+    /// Ark transaction that spends this VTXO, when reported by the indexer.
+    /// The creating virtual transaction is always `outpoint.txid`.
     pub ark_txid: Option<String>,
     /// Txid of the tx that spent this VTXO, if any.
     pub spent_by: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VtxoPage {
+    pub vtxos: Vec<VtxoRecord>,
+    pub current: i32,
+    pub next: i32,
+    pub total: i32,
 }
 
 #[derive(Clone)]
@@ -61,8 +78,11 @@ pub struct ArkadeRest {
 
 #[derive(Deserialize)]
 struct InfoResponse {
+    version: Option<String>,
     #[serde(rename = "signerPubkey")]
     signer_pubkey: String,
+    #[serde(rename = "forfeitPubkey")]
+    forfeit_pubkey: Option<String>,
     network: String,
     dust: String,
     #[serde(rename = "vtxoMinAmount")]
@@ -80,6 +100,14 @@ struct InfoResponse {
 #[derive(Deserialize)]
 struct GetVtxosResponse {
     vtxos: Option<Vec<IndexerVtxo>>,
+    page: Option<IndexerPage>,
+}
+
+#[derive(Deserialize)]
+struct IndexerPage {
+    current: Option<i32>,
+    next: Option<i32>,
+    total: Option<i32>,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +120,12 @@ struct IndexerVtxo {
     is_spent: Option<bool>,
     #[serde(rename = "isPreconfirmed")]
     is_preconfirmed: Option<bool>,
+    #[serde(rename = "isSwept")]
+    is_swept: Option<bool>,
+    #[serde(rename = "isUnrolled")]
+    is_unrolled: Option<bool>,
+    #[serde(rename = "expiresAt")]
+    expires_at: Option<String>,
     #[serde(rename = "arkTxid")]
     ark_txid: Option<String>,
     #[serde(rename = "spentBy")]
@@ -116,14 +150,6 @@ struct GetVirtualTxsResponse {
     txs: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-pub struct AssetInfoResponse {
-    #[serde(rename = "assetId")]
-    pub asset_id: String,
-    pub supply: Option<String>,
-    pub metadata: Option<String>,
-}
-
 #[derive(serde::Serialize)]
 struct SubmitTxRequest<'a> {
     #[serde(rename = "signedArkTx")]
@@ -143,6 +169,23 @@ struct SubmitTxResponse {
 }
 
 #[derive(serde::Serialize)]
+struct PendingIntentRequest {
+    intent: PendingIntent,
+}
+
+#[derive(serde::Serialize)]
+struct PendingIntent {
+    message: String,
+    proof: String,
+}
+
+#[derive(Deserialize)]
+struct GetPendingTxResponse {
+    #[serde(rename = "pendingTxs")]
+    pending_txs: Option<Vec<SubmitTxResponse>>,
+}
+
+#[derive(serde::Serialize)]
 struct FinalizeTxRequest<'a> {
     #[serde(rename = "arkTxid")]
     ark_txid: &'a str,
@@ -152,9 +195,12 @@ struct FinalizeTxRequest<'a> {
 
 #[cfg(target_arch = "wasm32")]
 async fn fetch_text(method: &str, url: &str, body: Option<String>) -> Result<String> {
+    web_log!("arkade request start: {method} {url}");
     let window = web_sys::window().ok_or_else(|| anyhow!("no window"))?;
     let init = web_sys::RequestInit::new();
     init.set_method(method);
+    let signal = web_sys::AbortSignal::timeout_with_u32(REQUEST_TIMEOUT_MS as u32);
+    init.set_signal(Some(&signal));
     if let Some(body) = body {
         let headers = web_sys::Headers::new().map_err(|e| anyhow!("headers: {e:?}"))?;
         headers
@@ -167,7 +213,7 @@ async fn fetch_text(method: &str, url: &str, body: Option<String>) -> Result<Str
         .map_err(|e| anyhow!("build request {url}: {e:?}"))?;
     let resp_value = JsFuture::from(window.fetch_with_request(&request))
         .await
-        .map_err(|e| anyhow!("fetch {url}: {e:?}"))?;
+        .map_err(|error| anyhow!("fetch {url}: {error:?}"))?;
     let resp: web_sys::Response = resp_value
         .dyn_into()
         .map_err(|e| anyhow!("not a response: {e:?}"))?;
@@ -180,13 +226,17 @@ async fn fetch_text(method: &str, url: &str, body: Option<String>) -> Result<Str
     if !resp.ok() {
         return Err(anyhow!("{method} {url} failed ({status}): {text}"));
     }
+    web_log!("arkade request complete: {method} {url} ({status})");
     Ok(text)
 }
 
 /// Native transport, used by tests and tooling. Same REST wire format.
 #[cfg(not(target_arch = "wasm32"))]
 async fn fetch_text(method: &str, url: &str, body: Option<String>) -> Result<String> {
-    let client = reqwest::Client::new();
+    web_log!("arkade request start: {method} {url}");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS as u64))
+        .build()?;
     let req = match method {
         "POST" => client.post(url),
         _ => client.get(url),
@@ -201,6 +251,7 @@ async fn fetch_text(method: &str, url: &str, body: Option<String>) -> Result<Str
     if !status.is_success() {
         return Err(anyhow!("{method} {url} failed ({status}): {text}"));
     }
+    web_log!("arkade request complete: {method} {url} ({status})");
     Ok(text)
 }
 
@@ -234,21 +285,32 @@ impl ArkadeRest {
         }
     }
 
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     pub async fn get_info(&self) -> Result<ServerParams> {
         let text = fetch_text("GET", &format!("{}/v1/info", self.base), None).await?;
-        let info: InfoResponse =
-            serde_json::from_str(&text).context("parse /v1/info response")?;
-        let signer_pk: bitcoin::PublicKey = info
-            .signer_pubkey
+        let info: InfoResponse = serde_json::from_str(&text).context("parse /v1/info response")?;
+        let signer_pk: bitcoin::PublicKey =
+            info.signer_pubkey.parse().context("parse signer pubkey")?;
+        let forfeit_pk = info
+            .forfeit_pubkey
+            .as_deref()
+            .unwrap_or(&info.signer_pubkey)
             .parse()
-            .context("parse signer pubkey")?;
-        let network = match info.network.as_str() {
+            .context("parse forfeit pubkey")?;
+        let network_name = info.network.to_ascii_lowercase();
+        let network = match network_name.as_str() {
             "bitcoin" | "mainnet" => bitcoin::Network::Bitcoin,
-            // mutinynet is signet-based; tark HRP applies either way.
-            _ => bitcoin::Network::Signet,
+            "mutinynet" | "signet" => bitcoin::Network::Signet,
+            "regtest" => bitcoin::Network::Regtest,
+            "testnet" => bitcoin::Network::Testnet,
+            "testnet4" => bitcoin::Network::Testnet4,
+            other => return Err(anyhow!("unsupported Arkade network {other}")),
         };
         if network == bitcoin::Network::Bitcoin {
-            web_log!("mainnet operator — real funds, alpha software");
+            web_log!("mainnet operator - real funds, alpha software");
         }
         let delay: i64 = info
             .unilateral_exit_delay
@@ -266,8 +328,11 @@ impl ArkadeRest {
             .require_network(network)
             .context("forfeit address network mismatch")?;
         Ok(ServerParams {
+            server_version: info.version.unwrap_or_else(|| "unknown".to_string()),
             signer_pk: signer_pk.inner.x_only_public_key().0,
+            forfeit_pk,
             network,
+            network_name,
             dust_sats: info.dust.parse().context("parse dust")?,
             vtxo_min_sats: info
                 .vtxo_min_amount
@@ -287,12 +352,44 @@ impl ArkadeRest {
         })
     }
 
-    /// Query VTXOs for a script hex. `filter` is one of "spendableOnly",
-    /// "spentOnly", or "" for all.
-    pub async fn get_vtxos(&self, script_hex: &str, filter: &str) -> Result<Vec<VtxoRecord>> {
+    /// Query one VTXO page for a script. `filter` is "spendableOnly",
+    /// "spentOnly", or empty.
+    pub async fn get_vtxos_page(
+        &self,
+        script_hex: &str,
+        filter: &str,
+        page_size: i32,
+        page_index: i32,
+    ) -> Result<VtxoPage> {
+        self.get_vtxos_page_many(&[script_hex.to_string()], filter, page_size, page_index)
+            .await
+    }
+
+    /// Query one VTXO page for multiple scripts. The REST gateway represents
+    /// protobuf repeated fields as repeated query parameters.
+    pub async fn get_vtxos_page_many(
+        &self,
+        script_hexes: &[String],
+        filter: &str,
+        page_size: i32,
+        page_index: i32,
+    ) -> Result<VtxoPage> {
+        if script_hexes.is_empty() {
+            return Ok(VtxoPage {
+                vtxos: Vec::new(),
+                current: page_index,
+                next: 0,
+                total: page_index,
+            });
+        }
+        let scripts = script_hexes
+            .iter()
+            .map(|script| format!("scripts={script}"))
+            .collect::<Vec<_>>()
+            .join("&");
         let mut url = format!(
-            "{}/v1/indexer/vtxos?scripts={}&page.size=500",
-            self.base, script_hex
+            "{}/v1/indexer/vtxos?{scripts}&page.size={page_size}&page.index={page_index}",
+            self.base,
         );
         if !filter.is_empty() {
             url.push_str(&format!("&{filter}=true"));
@@ -318,7 +415,11 @@ impl ArkadeRest {
                 .map(|a| {
                     (
                         a.asset_id,
-                        a.amount.as_deref().unwrap_or("0").parse().unwrap_or_default(),
+                        a.amount
+                            .as_deref()
+                            .unwrap_or("0")
+                            .parse()
+                            .unwrap_or_default(),
                     )
                 })
                 .collect();
@@ -332,28 +433,68 @@ impl ArkadeRest {
                 assets,
                 is_spent: v.is_spent.unwrap_or(false),
                 is_preconfirmed: v.is_preconfirmed.unwrap_or(false),
+                is_swept: v.is_swept.unwrap_or(false),
+                is_unrolled: v.is_unrolled.unwrap_or(false),
+                expires_at: v.expires_at.and_then(|value| value.parse().ok()),
                 ark_txid: v.ark_txid,
                 spent_by: v.spent_by,
             });
         }
-        Ok(out)
+        let page = resp.page.unwrap_or(IndexerPage {
+            current: Some(page_index),
+            next: Some(0),
+            total: Some(page_index),
+        });
+        Ok(VtxoPage {
+            vtxos: out,
+            current: page.current.unwrap_or(page_index),
+            next: page.next.unwrap_or(0),
+            total: page.total.unwrap_or(page_index),
+        })
+    }
+
+    /// Query every VTXO page and deduplicate shifting page boundaries.
+    pub async fn get_vtxos(&self, script_hex: &str, filter: &str) -> Result<Vec<VtxoRecord>> {
+        self.get_vtxos_many(&[script_hex.to_string()], filter).await
+    }
+
+    /// Query every VTXO page for a set of scripts.
+    pub async fn get_vtxos_many(
+        &self,
+        script_hexes: &[String],
+        filter: &str,
+    ) -> Result<Vec<VtxoRecord>> {
+        let mut index = 1;
+        let mut records = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let page = self
+                .get_vtxos_page_many(script_hexes, filter, 500, index)
+                .await?;
+            for record in page.vtxos {
+                if seen.insert(record.outpoint) {
+                    records.push(record);
+                }
+            }
+            if page.next <= page.current || page.next <= 0 || page.current >= page.total {
+                break;
+            }
+            index = page.next;
+        }
+        Ok(records)
     }
 
     /// Fetch full virtual transactions by txid.
     ///
-    /// The REST gateway encodes the gRPC `bytes` field as base64 — entries
-    /// are PSBTs (`cHNidP8…`) carrying signatures/witnesses in PSBT fields.
+    /// The REST gateway encodes the gRPC `bytes` field as base64; entries
+    /// are PSBTs (`cHNidP8...`) carrying signatures/witnesses in PSBT fields.
     /// A hex raw-transaction fallback is kept for other server versions.
     pub async fn get_virtual_txs(&self, txids: &[String]) -> Result<Vec<bitcoin::Psbt>> {
         use base64::Engine;
         if txids.is_empty() {
             return Ok(vec![]);
         }
-        let url = format!(
-            "{}/v1/indexer/virtualTx/{}",
-            self.base,
-            txids.join(",")
-        );
+        let url = format!("{}/v1/indexer/virtualTx/{}", self.base, txids.join(","));
         let text = fetch_text("GET", &url, None).await?;
         let resp: GetVirtualTxsResponse =
             serde_json::from_str(&text).context("parse virtual txs")?;
@@ -375,16 +516,6 @@ impl ArkadeRest {
                 bitcoin::Psbt::from_unsigned_tx(tx).context("wrap raw virtual tx")
             })
             .collect()
-    }
-
-    pub async fn get_asset(&self, asset_id: &str) -> Result<AssetInfoResponse> {
-        let text = fetch_text(
-            "GET",
-            &format!("{}/v1/indexer/asset/{asset_id}", self.base),
-            None,
-        )
-        .await?;
-        serde_json::from_str(&text).context("parse asset info")
     }
 
     /// Submit a signed ark tx + unsigned checkpoints; returns the server's
@@ -415,7 +546,9 @@ impl ArkadeRest {
         // The ark txid is the txid of the (cosigned) ark tx itself; the
         // server's arkTxid field may be empty over REST, so compute it.
         let txid = match resp.ark_txid.as_deref().filter(|s| s.len() == 64) {
-            Some(s) => s.parse().unwrap_or_else(|_| signed_ark.unsigned_tx.compute_txid()),
+            Some(s) => s
+                .parse()
+                .unwrap_or_else(|_| signed_ark.unsigned_tx.compute_txid()),
             None => signed_ark.unsigned_tx.compute_txid(),
         };
         let checkpoints = resp
@@ -430,7 +563,64 @@ impl ArkadeRest {
         Ok((txid, signed_ark, checkpoints))
     }
 
-    pub async fn finalize_tx(&self, txid: bitcoin::Txid, checkpoints: &[bitcoin::Psbt]) -> Result<()> {
+    /// Recover submitted but unfinalized transactions using an ownership
+    /// intent over their original VTXO inputs.
+    pub async fn get_pending_txs(
+        &self,
+        intent: ark_core::intent::Intent,
+    ) -> Result<Vec<(bitcoin::Txid, bitcoin::Psbt, Vec<bitcoin::Psbt>)>> {
+        use base64::Engine;
+        let body = serde_json::to_string(&PendingIntentRequest {
+            intent: PendingIntent {
+                message: intent
+                    .serialize_message()
+                    .map_err(|error| anyhow!("serialize pending intent message: {error}"))?,
+                proof: intent.serialize_proof(),
+            },
+        })?;
+        let text = fetch_text("POST", &format!("{}/v1/tx/pending", self.base), Some(body)).await?;
+        let response: GetPendingTxResponse =
+            serde_json::from_str(&text).context("parse pending tx response")?;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        response
+            .pending_txs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pending| {
+                let final_ark = pending
+                    .final_ark_tx
+                    .ok_or_else(|| anyhow!("pending response missing finalArkTx"))?;
+                let signed_ark = bitcoin::Psbt::deserialize(
+                    &b64.decode(final_ark).context("decode pending Ark PSBT")?,
+                )
+                .context("parse pending Ark PSBT")?;
+                let txid = pending
+                    .ark_txid
+                    .as_deref()
+                    .filter(|value| value.len() == 64)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(|| signed_ark.unsigned_tx.compute_txid());
+                let checkpoints = pending
+                    .signed_checkpoint_txs
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|entry| {
+                        bitcoin::Psbt::deserialize(
+                            &b64.decode(entry).context("decode pending checkpoint")?,
+                        )
+                        .context("parse pending checkpoint")
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((txid, signed_ark, checkpoints))
+            })
+            .collect()
+    }
+
+    pub async fn finalize_tx(
+        &self,
+        txid: bitcoin::Txid,
+        checkpoints: &[bitcoin::Psbt],
+    ) -> Result<()> {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
         let body = serde_json::to_string(&FinalizeTxRequest {

@@ -1,1107 +1,1768 @@
-//! Match orchestration: handshake, asset issuance, event tx sending,
-//! polling, causal ordering, and deterministic replay.
+//! Registry-and-burn-chain game orchestration.
 //!
-//! No server: the host's per-game Arkade address travels in the share link,
-//! the joiner answers with a START tx, and from then on both clients watch
-//! both players' VTXO scripts through the public indexer.
-//!
-//! Each match uses a FRESH keypair (new address per game), funded from the
-//! master key with one plain offchain send. The master key is the funding
-//! identity shown in the UI; the game key is the match identity in the link.
+//! There is no lobby, match, opponent connection, or peer transport. Every
+//! browser discovers players from one operator-specific registry script, then reads
+//! native move-asset burns from those players' scripts through the existing
+//! Arkade indexer.
 
 use crate::arkade::{ArkadeRest, ServerParams, VtxoRecord};
-use crate::game::{Input, Phase as SimPhase, Sim};
-use crate::gamelog::{order_events, payloads_from_tx, Event, Kind, Msg};
+use crate::game::PlayerState;
+use crate::gamelog::{canonical_moves, move_burn_from_tx, registration_player_script, MoveEvent};
 use crate::keys::Keys;
-use crate::{gamelog, txbuild};
-use anyhow::{anyhow, Result};
+use crate::txbuild;
+use anyhow::{anyhow, Context, Result};
 use ark_core::asset::AssetId;
-use bitcoin::Txid;
-use std::collections::HashSet;
+use base64::Engine;
+use bitcoin::{OutPoint, Psbt, Txid};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-pub const BULLET_SUPPLY: u64 = crate::game::START_AMMO as u64;
-/// Sats moved from the master key into a fresh game key at match start.
-pub const GAME_FUND_SATS: u64 = 5_000;
+/// Mutinynet Arkade default VTXO whose owner is the standard BIP341 NUMS key.
+/// Both virtual spending paths require the unknown NUMS secret. Each player
+/// sends one registration output here; moves return their carrier to the
+/// player's own script. The operator may sweep registration backing sats after
+/// VTXO expiry.
+/// Recompute it with `cargo run --example burnaddr`.
+pub const GAME_ADDRESS: &str = "tark1qqcpq7yq3e8hhsx6ml3fud93m7827qggaurtzu3zwsr4a0qs0gf85xacghv2fqfrv43e4mgekvqq6ul7u65wm8u7tk3t67kl9syxt822nw9wzn";
+
+const MAX_INPUT_QUEUE: usize = 16;
+const INDEX_PAGE_SIZE: i32 = 500;
+const PLAYER_SCRIPT_BATCH_SIZE: usize = 20;
+const MIN_INPUT_LIFETIME_SECS: i64 = 3_600;
+const PENDING_JOURNAL_VERSION: u8 = 1;
+const MAX_PENDING_JOURNAL_BYTES: usize = 2_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    Idle,
-    /// Host: waiting for a START tx to arrive.
-    Hosting,
-    /// Joiner/host: funding the game key from the master key.
-    JoinFunding,
-    /// Joiner: START sent, waiting for the host's ACK.
-    JoinSent,
-    /// Handshake done; issuing the bullet asset.
-    Arming,
+    FundWallet,
+    Issuing,
+    Syncing,
     Playing,
-    Done { winner: usize, verified: bool },
+    OutOfMoves,
 }
 
-pub struct MatchApp {
-    /// The persistent funding identity (shown in the UI, funded externally).
-    pub master: Keys,
-    /// The active signing identity: the master key when idle, a fresh
-    /// per-match key once hosting/joining.
+#[derive(Clone)]
+enum PendingAction {
+    Issuance {
+        pending: txbuild::PendingFinalize,
+        asset_ids: [AssetId; 4],
+    },
+    Move {
+        pending: txbuild::PendingFinalize,
+        direction: u8,
+        sequence: u32,
+    },
+    UnknownIssuance {
+        submission: txbuild::UnknownSubmission,
+        asset_ids: [AssetId; 4],
+    },
+    UnknownMove {
+        submission: txbuild::UnknownSubmission,
+        direction: u8,
+        sequence: u32,
+    },
+    Sweep {
+        pending: txbuild::PendingFinalize,
+    },
+    UnknownSweep {
+        submission: txbuild::UnknownSubmission,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingJournal {
+    version: u8,
+    server: String,
+    address: String,
+    signer: String,
+    action: PendingJournalAction,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum PendingJournalAction {
+    Issuance {
+        transaction: JournalTransaction,
+        asset_ids: [String; 4],
+    },
+    Move {
+        transaction: JournalTransaction,
+        direction: u8,
+        sequence: u32,
+    },
+    Sweep {
+        transaction: JournalTransaction,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalTransaction {
+    stage: JournalStage,
+    txid: String,
+    signed_ark: String,
+    checkpoints: Vec<String>,
+    last_error: String,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum JournalStage {
+    Prepared,
+    Finalizing,
+}
+
+enum RestoredTransaction {
+    Prepared(txbuild::UnknownSubmission),
+    Finalizing(txbuild::PendingFinalize),
+}
+
+pub struct GameApp {
     pub keys: Keys,
     pub rest: ArkadeRest,
     pub params: ServerParams,
     pub info: ark_core::server::Info,
+    game_address: ark_core::ArkAddress,
+    game_script: String,
 
     pub phase: Phase,
-    pub match_tag: Option<[u8; 8]>,
-    pub opponent_addr: Option<ark_core::ArkAddress>,
-
-    /// My bullet asset (issued at match start).
-    pub my_bullet_asset: Option<AssetId>,
-    /// Opponent's bullet asset, first seen on their script (informational).
-    pub opp_bullet_asset: Option<String>,
-
-    seq: u32,
-    last_sent_tag: [u8; 8],
-    sent_txids: HashSet<Txid>,
-
-    events: Vec<Event>,
-    /// Virtual txids successfully fetched and parsed.
-    seen_txs: HashSet<Txid>,
-    /// Fetch failures per txid; after a few tries an id is treated as
-    /// non-virtual (boarding/commitment) and skipped permanently.
-    fetch_failures: std::collections::HashMap<Txid, u32>,
-
-    pub sim: Option<Sim>,
-    pub sim_inputs: Vec<Input>,
-
-    /// A send is in flight (wasm is single-threaded; this serializes sends).
+    move_assets: Option<[AssetId; 4]>,
+    move_balances: [u64; 4],
+    issuance_visible: bool,
+    funding_ready: bool,
+    next_sequence: u32,
+    pending_dirs: VecDeque<u8>,
     pub sending: bool,
-    /// Queued direction presses (dir bytes), packed into move txs.
-    pub pending_dirs: Vec<u8>,
-    pub pending_fires: u32,
-    /// Outpoints the operator reports as spent by a pending tx we crashed
-    /// mid-finalize; skipped when picking inputs.
-    excluded_outpoints: HashSet<String>,
-    /// Last poll error text surfaced to the log (dedupes repeats).
-    last_poll_error: Option<String>,
-    /// Wall-clock ms of the last successful poll (UI proof of life).
-    last_sync_ms: u64,
-    /// Balance cached from the latest poll, for the snapshot.
-    balance_cache: u64,
+    pending_action: Option<PendingAction>,
 
+    events: Vec<MoveEvent>,
+    registered_players: BTreeMap<Txid, String>,
+    invalid_registrations: HashSet<Txid>,
+    seen_registry_outputs: HashSet<OutPoint>,
+    unresolved_registry_outputs: HashMap<OutPoint, VtxoRecord>,
+    seen_player_outputs: HashSet<OutPoint>,
+    unresolved_player_outputs: HashMap<OutPoint, VtxoRecord>,
+    seen_move_txs: HashSet<Txid>,
+    fully_scanned_player_scripts: HashSet<String>,
+    initial_registry_sync: bool,
+    initial_player_sync: bool,
+    game_sync_count: u32,
+
+    excluded_outpoints: HashSet<String>,
+    balance_cache: u64,
+    wallet_records: Vec<VtxoRecord>,
+    wallet_sync_ms: u64,
+    last_sync_ms: u64,
+    last_error: Option<String>,
     pub log: Vec<String>,
 }
 
-impl MatchApp {
-    pub fn new(master: Keys, rest: ArkadeRest, params: ServerParams) -> Self {
+impl GameApp {
+    pub fn new(keys: Keys, rest: ArkadeRest, params: ServerParams) -> Result<Self> {
+        if params.max_op_return_outputs < 2 || params.vtxo_min_sats > params.dust_sats {
+            return Err(anyhow!(
+                "operator limits no longer support one asset packet plus one move receipt"
+            ));
+        }
+        if params.network_name != "mutinynet" {
+            return Err(anyhow!("Arkade Maze currently supports Mutinynet only"));
+        }
+        let game_address = nums_registry_address(&params)?;
+        if game_address.encode() != GAME_ADDRESS {
+            return Err(anyhow!(
+                "Mutinynet operator parameters do not match the pinned game registry"
+            ));
+        }
+        let game_script = game_address.to_p2tr_script_pubkey().to_hex_string();
         let info = txbuild::server_info(&params);
-        let active = Keys::from_hex(&master.secret_hex()).expect("same key");
-        Self {
-            master,
-            keys: active,
+        let network_name = params.network_name.clone();
+        let server = rest.base().to_string();
+        Ok(Self {
+            keys,
             rest,
             params,
             info,
-            phase: Phase::Idle,
-            match_tag: None,
-            opponent_addr: None,
-            my_bullet_asset: None,
-            opp_bullet_asset: None,
-            seq: 0,
-            last_sent_tag: [0; 8],
-            sent_txids: HashSet::new(),
-            events: Vec::new(),
-            seen_txs: HashSet::new(),
-            fetch_failures: std::collections::HashMap::new(),
-            sim: None,
-            sim_inputs: Vec::new(),
+            game_address,
+            game_script,
+            phase: Phase::FundWallet,
+            move_assets: None,
+            move_balances: [0; 4],
+            issuance_visible: false,
+            funding_ready: false,
+            next_sequence: 0,
+            pending_dirs: VecDeque::new(),
             sending: false,
-            pending_dirs: Vec::new(),
-            pending_fires: 0,
+            pending_action: None,
+            events: Vec::new(),
+            registered_players: BTreeMap::new(),
+            invalid_registrations: HashSet::new(),
+            seen_registry_outputs: HashSet::new(),
+            unresolved_registry_outputs: HashMap::new(),
+            seen_player_outputs: HashSet::new(),
+            unresolved_player_outputs: HashMap::new(),
+            seen_move_txs: HashSet::new(),
+            fully_scanned_player_scripts: HashSet::new(),
+            initial_registry_sync: false,
+            initial_player_sync: false,
+            game_sync_count: 0,
             excluded_outpoints: HashSet::new(),
-            last_poll_error: None,
-            last_sync_ms: 0,
             balance_cache: 0,
-            log: Vec::new(),
+            wallet_records: Vec::new(),
+            wallet_sync_ms: 0,
+            last_sync_ms: 0,
+            last_error: None,
+            log: vec![format!(
+                "connected to {network_name} at {server}; watching registry {}",
+                game_address.encode()
+            )],
+        })
+    }
+
+    pub fn player_address(&self) -> ark_core::ArkAddress {
+        txbuild::player_vtxo(&self.keys, &self.params)
+            .expect("player VTXO")
+            .to_ark_address()
+    }
+
+    fn player_script(&self) -> String {
+        txbuild::player_vtxo(&self.keys, &self.params)
+            .expect("player VTXO")
+            .script_pubkey()
+            .to_hex_string()
+    }
+
+    pub fn game_address(&self) -> String {
+        self.game_address.encode()
+    }
+
+    pub fn export_pending_journal(&self) -> Result<Option<String>> {
+        let Some(action) = self.pending_action.as_ref() else {
+            return Ok(None);
+        };
+        let journal = PendingJournal {
+            version: PENDING_JOURNAL_VERSION,
+            server: self.rest.base().to_string(),
+            address: self.player_address().encode(),
+            signer: self.params.signer_pk.to_string(),
+            action: pending_action_to_journal(action),
+        };
+        Ok(Some(serde_json::to_string(&journal)?))
+    }
+
+    pub fn restore_pending_journal(&mut self, raw: &str) -> Result<()> {
+        if raw.len() > MAX_PENDING_JOURNAL_BYTES {
+            return Err(anyhow!("pending transaction journal is too large"));
         }
+        let journal: PendingJournal =
+            serde_json::from_str(raw).context("parse pending transaction journal")?;
+        if journal.version != PENDING_JOURNAL_VERSION {
+            return Err(anyhow!(
+                "unsupported pending transaction journal version {}",
+                journal.version
+            ));
+        }
+        if journal.server != self.rest.base() {
+            return Err(anyhow!("pending transaction belongs to a different server"));
+        }
+        if journal.address != self.player_address().encode() {
+            return Err(anyhow!("pending transaction belongs to a different wallet"));
+        }
+        if journal.signer != self.params.signer_pk.to_string() {
+            return Err(anyhow!(
+                "pending transaction belongs to a different operator signer"
+            ));
+        }
+
+        let action = pending_action_from_journal(journal.action)?;
+        let txid = pending_action_txid(&action);
+        if let PendingAction::Issuance { asset_ids, .. }
+        | PendingAction::UnknownIssuance { asset_ids, .. } = &action
+        {
+            self.phase = Phase::Issuing;
+            self.move_assets = Some(*asset_ids);
+            self.move_balances = [txbuild::MOVE_SUPPLY; 4];
+            self.next_sequence = 0;
+            self.registered_players.insert(txid, self.player_script());
+        }
+        self.pending_action = Some(action);
+        self.log_line(format!(
+            "restored pending transaction {} from browser journal",
+            short_txid(&txid)
+        ));
+        Ok(())
     }
 
-    fn in_match(&self) -> bool {
-        self.game_key_hex().is_some()
-    }
-
-    /// The game key hex, if a per-match key is active.
-    fn game_key_hex(&self) -> Option<String> {
-        let active = self.keys.secret_hex();
-        (active != self.master.secret_hex()).then_some(active)
-    }
-
-    fn new_game_key(&mut self) {
-        self.keys = Keys::generate().expect("rng");
-        self.log_line("new game key → fresh address for this match");
-    }
-
-    /// The address to show for funding: the master key's.
-    pub fn funding_address(&self) -> ark_core::ArkAddress {
-        txbuild::player_vtxo(&self.master, &self.params)
-            .expect("vtxo")
-            .to_ark_address()
-    }
-
-    /// The active (match) address: goes into links and START payloads.
-    pub fn my_address(&self) -> ark_core::ArkAddress {
-        txbuild::player_vtxo(&self.keys, &self.params)
-            .expect("vtxo")
-            .to_ark_address()
-    }
-
-    pub fn my_script_hex(&self) -> String {
-        txbuild::player_vtxo(&self.keys, &self.params)
-            .expect("vtxo")
-            .script_pubkey()
-            .to_hex_string()
-    }
-
-    fn master_script_hex(&self) -> String {
-        txbuild::player_vtxo(&self.master, &self.params)
-            .expect("vtxo")
-            .script_pubkey()
-            .to_hex_string()
+    pub fn required_funding(&self) -> u64 {
+        self.params.dust_sats.saturating_mul(2)
     }
 
     fn log_line(&mut self, line: impl Into<String>) {
         self.log.push(line.into());
-        if self.log.len() > 200 {
+        if self.log.len() > 100 {
             self.log.remove(0);
         }
     }
 
-    async fn spendable_for(&self, keys: &Keys) -> Result<Vec<VtxoRecord>> {
-        let script = txbuild::player_vtxo(keys, &self.params)?
-            .script_pubkey()
-            .to_hex_string();
-        self.rest.get_vtxos(&script, "spendableOnly").await
+    pub fn queue_inputs(&mut self, dirs: &[u8]) {
+        if self.phase != Phase::Playing || self.pending_action.is_some() {
+            return;
+        }
+        for &dir in dirs {
+            if dir <= crate::game::DIR_LEFT && self.pending_dirs.len() < MAX_INPUT_QUEUE {
+                self.pending_dirs.push_back(dir);
+            }
+        }
     }
 
-    /// My spendable VTXOs on the active script.
-    pub async fn my_spendable(&self) -> Result<Vec<VtxoRecord>> {
-        self.spendable_for(&self.keys).await
-    }
+    /// Serialized browser tick: refresh wallet state, recover pending wallet
+    /// actions, then synchronize game history before executing a move.
+    pub async fn step(&mut self, dirs: &[u8], sweep_address: Option<&str>) {
+        self.queue_inputs(dirs);
 
-    pub async fn balance_sats(&self) -> Result<u64> {
-        let master: u64 = self
-            .spendable_for(&self.master)
-            .await?
-            .iter()
-            .map(|v| v.amount_sats)
-            .sum();
-        let game: u64 = if self.in_match() {
-            self.my_spendable().await?.iter().map(|v| v.amount_sats).sum()
+        let player_script = self.player_script();
+        let spendable = match self.rest.get_vtxos(&player_script, "spendableOnly").await {
+            Ok(records) => records,
+            Err(err) => {
+                self.report_error("wallet sync", &err);
+                return;
+            }
+        };
+        // The indexer extracts the P2TR pubkey and returns regular and sub-dust
+        // VTXOs associated with that key.
+        let diagnostics_ready = match self.rest.get_vtxos(&player_script, "").await {
+            Ok(records) => {
+                self.wallet_records = records;
+                self.wallet_sync_ms = now_ms();
+                true
+            }
+            Err(err) => {
+                self.report_error("wallet diagnostics", &err);
+                false
+            }
+        };
+        if self.move_assets.is_none() {
+            match self.discover_move_assets(&spendable).await {
+                Ok(()) => {}
+                Err(err) => {
+                    self.report_error("asset recovery", &err);
+                    return;
+                }
+            }
+        }
+        self.refresh_wallet_state(&spendable);
+        self.reconcile_next_sequence();
+
+        if self.pending_action.is_some() {
+            self.resume_pending(&spendable).await;
+            return;
+        }
+
+        if let Some(destination) = sweep_address {
+            if let Err(err) = self.sweep_wallet(&spendable, destination).await {
+                self.handle_send_error("wallet sweep", &err);
+            }
+            return;
+        }
+
+        let game_ready = match self.refresh_game().await {
+            Ok(()) => true,
+            Err(err) => {
+                self.report_error("game sync", &err);
+                false
+            }
+        };
+        self.reconcile_next_sequence();
+
+        if !game_ready {
+            return;
+        }
+        if diagnostics_ready {
+            self.clear_error();
+        }
+
+        if self.move_assets.is_none() {
+            if self.funding_ready && !self.sending {
+                if let Err(err) = self.issue_move_assets(&spendable).await {
+                    self.handle_send_error("issuance", &err);
+                }
+            }
+            return;
+        }
+
+        if self.issuance_visible && self.move_balances.iter().all(|amount| *amount == 0) {
+            self.phase = Phase::OutOfMoves;
+            self.pending_dirs.clear();
+            return;
+        }
+        if self.issuance_visible {
+            if !self.local_history_ready() {
+                self.phase = Phase::Syncing;
+                return;
+            }
+            self.phase = Phase::Playing;
         } else {
-            0
+            self.phase = Phase::Issuing;
+            return;
+        }
+
+        if !self.sending {
+            self.flush_one_move(&spendable).await;
+        }
+    }
+
+    fn refresh_wallet_state(&mut self, spendable: &[VtxoRecord]) {
+        self.balance_cache = spendable.iter().map(|record| record.amount_sats).sum();
+        self.funding_ready = self.registration_inputs(spendable).is_some();
+        let Some(asset_ids) = self.move_assets else {
+            self.phase = Phase::FundWallet;
+            return;
         };
-        Ok(master + game)
-    }
 
-    /// Ensure the active game key holds funds; if not, move some from the
-    /// master key with a plain offchain send. Returns true when funded.
-    async fn ensure_game_funded(&mut self) -> Result<bool> {
-        if !self.in_match() {
-            return Ok(true);
-        }
-        if !self.my_spendable().await?.is_empty() {
-            return Ok(true);
-        }
-        let master_spendable = self.spendable_for(&self.master).await?;
-        let funding = master_spendable
-            .iter()
-            .filter(|v| !self.excluded_outpoints.contains(&v.outpoint.to_string()))
-            .max_by_key(|v| v.amount_sats)
-            .cloned()
-            .ok_or_else(|| anyhow!("master wallet is empty — fund your address first"))?;
-        let game_addr = self.my_address();
-        let (ark_tx, checkpoints) = txbuild::build_send_tx(
-            &self.master,
-            &self.params,
-            &self.info,
-            &[funding],
-            game_addr,
-            GAME_FUND_SATS,
-        )?;
-        let master = self.master.clone();
-        let txid = self.send_raw_with(&master, ark_tx, checkpoints).await?;
-        self.log_line(format!("funded game key with {GAME_FUND_SATS} sats (tx {txid})"));
-        Ok(false) // funds visible on next poll
-    }
-
-    /// Become the host: fresh game key/address, then wait for a START.
-    pub fn host_game(&mut self) {
-        self.new_game_key();
-        self.phase = Phase::Hosting;
-        self.log_line("hosting: share your link, waiting for START tx");
-    }
-
-    /// Forget all match state (local only; the chains on the indexer are
-    /// immutable). The game key is dropped; the master key is kept.
-    pub fn reset_match(&mut self) {
-        let master = Keys::from_hex(&self.master.secret_hex()).expect("same key");
-        let rest = self.rest.clone();
-        let params = self.params.clone();
-        *self = MatchApp::new(master, rest, params);
-        self.log_line("match state reset");
-    }
-
-    /// Join via the host's address: fresh game key, fund it, send START.
-    /// Idempotent: if our chain history already contains a START paying this
-    /// host (same game key), adopt it instead of sending a second one.
-    pub async fn join_game(&mut self, host_address: &str) -> Result<()> {
-        let host = ark_core::ArkAddress::decode(host_address)
-            .map_err(|e| anyhow!("bad host address: {e}"))?;
-
-        // Rejoining with an active match key? Otherwise start fresh.
-        if !self.in_match() {
-            self.new_game_key();
-        }
-        if host == self.my_address() {
-            return Err(anyhow!(
-                "that's your own address — open the invite link on the other player's device/browser"
-            ));
-        }
-        // Enter the funding phase *before* the check so the poll loop keeps
-        // retrying: as soon as the master wallet lands funds, the join
-        // proceeds by itself.
-        self.opponent_addr = Some(host);
-        self.phase = Phase::JoinFunding;
-        match self.ensure_game_funded().await {
-            Ok(true) => {}
-            Ok(false) => {
-                self.log_line("funding game key; will send START when it lands");
-                return Ok(());
-            }
-            Err(e) => {
-                self.log_line(format!("join: {e:#}"));
-                return Ok(());
-            }
-        }
-        if self.adopt_existing_start(host).await? {
-            return Ok(());
-        }
-        self.send_start(host).await
-    }
-
-    /// Scan our own chain history for a START that pays this host's script.
-    async fn adopt_existing_start(&mut self, host: ark_core::ArkAddress) -> Result<bool> {
-        let my_addr = self.my_address().encode();
-        let records = self.rest.get_vtxos(&self.my_script_hex(), "").await?;
-        // Same fallback as the collector: arkTxid can be empty; the outpoint
-        // txid is the creating virtual tx for offchain outputs.
-        let txids: Vec<String> = records
-            .iter()
-            .map(|r| {
-                r.ark_txid
-                    .clone()
-                    .filter(|t| t.len() == 64)
-                    .unwrap_or_else(|| r.outpoint.txid.to_string())
-            })
-            .collect();
-        if txids.is_empty() {
-            return Ok(false);
-        }
-        let host_script = host.to_p2tr_script_pubkey();
-        for psbt in self.rest.get_virtual_txs(&txids).await? {
-            let tx = &psbt.unsigned_tx;
-            if !tx.output.iter().any(|o| o.script_pubkey == host_script) {
-                continue;
-            }
-            for payload in payloads_from_tx(tx) {
-                let Some(msg) = Msg::decode(&payload) else { continue };
-                if msg.kind == Kind::Start && msg.data == my_addr.as_bytes() {
-                    let txid = tx.compute_txid();
-                    self.match_tag = Some(gamelog::txid_tag(&txid));
-                    self.opponent_addr = Some(host);
-                    self.sent_txids.insert(txid);
-                    self.phase = Phase::JoinSent;
-                    self.log_line(format!("reusing earlier START (tx {txid}); waiting for ACK"));
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    async fn send_start(&mut self, host: ark_core::ArkAddress) -> Result<()> {
-        let funding = self.chain_input().await?;
-        // START: dust to the host + our game address in the OP_RETURN payload.
-        // The match tag derives from the START txid once the tx exists.
-        let msg = Msg {
-            match_tag: [0; 8],
-            seq: self.seq,
-            prev: [0; 8],
-            tick_ms: now_ms(),
-            kind: Kind::Start,
-            data: self.my_address().encode().into_bytes(),
-        };
-        let (ark_tx, checkpoints) = txbuild::build_message_tx(
-            &self.keys,
-            &self.params,
-            &self.info,
-            &[funding],
-            host,
-            self.params.dust_sats,
-            &msg.encode(),
-        )?;
-        let txid = self.send_raw(ark_tx, checkpoints).await?;
-        self.match_tag = Some(gamelog::txid_tag(&txid));
-        self.opponent_addr = Some(host);
-        self.phase = Phase::JoinSent;
-        self.log_line(format!("START sent (tx {txid}); waiting for ACK"));
-        Ok(())
-    }
-
-    /// Build, sign, submit, finalize; remember the txid as ours.
-    async fn send_raw(
-        &mut self,
-        ark_tx: bitcoin::Psbt,
-        checkpoints: Vec<bitcoin::Psbt>,
-    ) -> Result<Txid> {
-        let keys = self.keys.clone();
-        self.send_raw_with(&keys, ark_tx, checkpoints).await
-    }
-
-    /// Same as [`send_raw`], but signs with an explicit key. Funding sends
-    /// spend master-key inputs and must be signed by the master key.
-    async fn send_raw_with(
-        &mut self,
-        keys: &Keys,
-        ark_tx: bitcoin::Psbt,
-        checkpoints: Vec<bitcoin::Psbt>,
-    ) -> Result<Txid> {
-        self.sending = true;
-        let result = txbuild::run_tx(keys, &self.rest, ark_tx, checkpoints).await;
-        self.sending = false;
-        let txid = result?;
-        self.sent_txids.insert(txid);
-        self.last_sent_tag = gamelog::txid_tag(&txid);
-        self.seq += 1;
-        Ok(txid)
-    }
-
-    fn next_msg(&mut self, kind: Kind, data: Vec<u8>) -> Msg {
-        Msg {
-            match_tag: self.match_tag.unwrap_or([0; 8]),
-            seq: self.seq,
-            prev: self.last_sent_tag,
-            tick_ms: now_ms(),
-            kind,
-            data,
-        }
-    }
-
-    /// Queue direction presses (dir bytes) and fire presses.
-    pub fn queue_inputs(&mut self, dirs: &[u8], fires: u32) {
-        const MAX_QUEUE: usize = 8;
-        for &d in dirs {
-            if self.pending_dirs.len() < MAX_QUEUE {
-                self.pending_dirs.push(d);
-            }
-        }
-        if fires > 0 {
-            self.pending_fires = (self.pending_fires + fires).min(4);
-        }
-    }
-
-    /// Drive pending sends; at most one tx per step (they are serialized and
-    /// each takes a network round trip).
-    pub async fn flush_pending(&mut self) -> Result<()> {
-        if self.sending || !matches!(self.phase, Phase::Playing) {
-            return Ok(());
-        }
-        if self.pending_fires > 0 {
-            self.pending_fires -= 1;
-            if let Err(e) = self.send_fire().await {
-                self.handle_send_error(&e);
-            }
-            return Ok(());
-        }
-        if !self.pending_dirs.is_empty() {
-            // Pack up to 4 direction steps into one move tx.
-            let n = self.pending_dirs.len().min(4);
-            let dirs: Vec<u8> = self.pending_dirs.drain(..n).collect();
-            if let Err(e) = self.send_move(&dirs).await {
-                self.handle_send_error(&e);
-            }
-        }
-        Ok(())
-    }
-
-    /// Log a send failure; if the operator says an input is held by a stale
-    /// pending tx, exclude that outpoint so future sends pick another one.
-    fn handle_send_error(&mut self, err: &anyhow::Error) {
-        let text = format!("{err:#}");
-        if let Some(op) = extract_spent_outpoint(&text) {
-            if self.excluded_outpoints.insert(op.clone()) {
-                self.log_line(format!("input {op} held by a pending tx; skipping it"));
-            }
-        }
-        self.log_line(format!("send failed: {text}"));
-    }
-
-    async fn chain_input(&self) -> Result<VtxoRecord> {
-        let spendable = self.my_spendable().await?;
-        // Continue from the largest spendable output: the self-send change
-        // output forms the chain naturally. Skip outpoints the server still
-        // holds as spent by a pending tx we crashed out of.
-        spendable
-            .into_iter()
-            .filter(|v| !self.excluded_outpoints.contains(&v.outpoint.to_string()))
-            .max_by_key(|v| v.amount_sats)
-            .ok_or_else(|| anyhow!("no spendable VTXO for event tx"))
-    }
-
-    async fn send_move(&mut self, dirs: &[u8]) -> Result<()> {
-        let input = self.chain_input().await?;
-        let msg = self.next_msg(Kind::Move, dirs.to_vec());
-        let (ark_tx, checkpoints) =
-            txbuild::build_event_tx(&self.keys, &self.params, &self.info, &input, &msg.encode())?;
-        let txid = self.send_raw(ark_tx, checkpoints).await?;
-        self.log_line(format!("move {:?} → {txid}", dirs));
-        Ok(())
-    }
-
-    async fn send_fire(&mut self) -> Result<()> {
-        let asset = self
-            .my_bullet_asset
-            .ok_or_else(|| anyhow!("bullet asset not issued yet"))?;
-        let spendable = self.my_spendable().await?;
-        let asset_id_str = asset.to_string();
-        let Some(carrier) = spendable
-            .iter()
-            .find(|v| v.assets.iter().any(|(id, amt)| id == &asset_id_str && *amt > 0))
-            .cloned()
-        else {
-            self.log_line("out of ammo (no bullet asset VTXO)");
-            return Ok(());
-        };
-        // weapon id 0 = standard bullet; the byte also keeps the payload
-        // off the 32-byte sub-dust VTXO script shape.
-        let msg = self.next_msg(Kind::Fire, vec![0]);
-        let (ark_tx, checkpoints) = txbuild::build_burn_tx(
-            &self.keys,
-            &self.params,
-            &self.info,
-            &[carrier],
-            asset,
-            1,
-            &msg.encode(),
-        )?;
-        let txid = self.send_raw(ark_tx, checkpoints).await?;
-        self.log_line(format!("fire! burn in {txid}"));
-        Ok(())
-    }
-
-    async fn issue_bullets(&mut self) -> Result<()> {
-        // Issuance pays ourselves dust for the asset output; avoid inputs
-        // whose change would land in the invalid sub-dust band (0 < change < dust).
-        let spendable = self.my_spendable().await?;
-        let dust = self.params.dust_sats;
-        let input = spendable
-            .iter()
-            .filter(|v| !self.excluded_outpoints.contains(&v.outpoint.to_string()))
-            .filter(|v| v.amount_sats == dust || v.amount_sats >= 2 * dust)
-            .max_by_key(|v| v.amount_sats)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!("no issuance-compatible VTXO (need exactly {dust} or >= {} sats)", 2 * dust)
-            })?;
-        let metadata = vec![
-            ("game".to_string(), "arkade-duel".to_string()),
-            ("match".to_string(), hex8(&self.match_tag.unwrap_or([0; 8]))),
-            ("kind".to_string(), "bullet:standard".to_string()),
-        ];
-        let (ark_tx, checkpoints, asset_id) = txbuild::build_issue_tx(
-            &self.keys,
-            &self.params,
-            &self.info,
-            &input,
-            BULLET_SUPPLY,
-            metadata,
-        )?;
-        let txid = self.send_raw(ark_tx, checkpoints).await?;
-        self.my_bullet_asset = Some(asset_id);
-        self.log_line(format!("issued {BULLET_SUPPLY} bullets, asset {asset_id} (tx {txid})"));
-        Ok(())
-    }
-
-    async fn send_end(&mut self, state_hash: u64) -> Result<()> {
-        let input = self.chain_input().await?;
-        let msg = self.next_msg(Kind::End, state_hash.to_le_bytes().to_vec());
-        let (ark_tx, checkpoints) =
-            txbuild::build_event_tx(&self.keys, &self.params, &self.info, &input, &msg.encode())?;
-        let txid = self.send_raw(ark_tx, checkpoints).await?;
-        self.log_line(format!("END sent (state {state_hash:016x}) in {txid}"));
-        Ok(())
-    }
-
-    /// Handle a one-shot UI command ("host" / "join"). State-changing;
-    /// callers should persist right after this returns.
-    pub async fn handle_command(&mut self, command: &str, arg: &str) {
-        match command {
-            // A new game is always allowed: reset local match state first so
-            // the same wallet can play back-to-back matches.
-            "host" => {
-                if self.phase != Phase::Idle {
-                    self.reset_match();
-                }
-                self.host_game();
-            }
-            "join" => {
-                let already_on_it = matches!(self.phase, Phase::JoinFunding | Phase::JoinSent)
-                    && self.opponent_addr.map(|a| a.encode()) == Some(arg.to_string());
-                if already_on_it {
-                    return; // duplicate click on the same invite
-                }
-                if self.phase != Phase::Idle {
-                    self.reset_match();
-                }
-                if let Err(e) = self.join_game(arg).await {
-                    self.log_line("join failed");
-                    self.handle_send_error(&e);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// The serialized driver tick: queue inputs, poll, advance.
-    pub async fn step(&mut self, dirs: &[u8], fires: u32) -> Result<()> {
-        self.queue_inputs(dirs, fires);
-
-        if let Err(e) = self.refresh().await {
-            let text = format!("{e:#}");
-            if self.last_poll_error.as_deref() != Some(text.as_str()) {
-                self.last_poll_error = Some(text.clone());
-                self.log_line(format!("sync: {text}"));
-            }
-        } else {
-            self.last_poll_error = None;
-            self.last_sync_ms = now_ms();
-        }
-
-        self.balance_cache = self.balance_sats().await.unwrap_or(self.balance_cache);
-        Ok(())
-    }
-
-    /// Poll indexer, ingest new txs, advance the state machine and sim.
-    pub async fn refresh(&mut self) -> Result<()> {
-        // 1. Collect new events from both scripts.
-        self.collect_side().await?;
-        if let Some(opp_script) = self.opponent_script() {
-            self.collect_side_scripts(&[opp_script]).await?;
-        }
-
-        // 2. State machine transitions driven by what we ingested.
-        match self.phase {
-            Phase::Hosting => {
-                if let Some((tag, joiner)) = self.find_start() {
-                    self.adopt_start(tag, joiner).await?;
-                }
-            }
-            Phase::JoinFunding => {
-                // The join command ran before the game key was funded; retry.
-                if let Some(host) = self.opponent_addr {
-                    if let Err(e) = self.join_game(&host.encode()).await {
-                        self.handle_send_error(&e);
-                    }
-                }
-            }
-            Phase::JoinSent => {
-                if self.find_ack() {
-                    self.begin_match().await?;
-                }
-            }
-            Phase::Arming => {
-                if self.my_bullet_asset.is_none() && !self.sending {
-                    if let Err(e) = self.issue_bullets().await {
-                        self.handle_send_error(&e);
-                    }
-                } else if self.my_bullet_asset.is_some() {
-                    self.phase = Phase::Playing;
-                    self.log_line("match live — WASD steps, space fires");
-                }
-            }
-            Phase::Playing => {
-                self.flush_pending().await?;
-            }
-            _ => {}
-        }
-
-        // 3. Feed the sim and detect the end.
-        self.advance_sim().await?;
-        Ok(())
-    }
-
-    fn opponent_script(&self) -> Option<String> {
-        let addr = self.opponent_addr?;
-        Some(addr.to_p2tr_script_pubkey().to_hex_string())
-    }
-
-    async fn collect_side(&mut self) -> Result<()> {
-        // While hosting, watch the game key's script (START lands there).
-        let scripts = [self.my_script_hex()];
-        self.collect_side_scripts(&scripts).await
-    }
-
-    /// Ingest new game txs visible on one side's scripts.
-    async fn collect_side_scripts(&mut self, scripts: &[String]) -> Result<()> {
-        let mut records = Vec::new();
-        for s in scripts {
-            records.extend(self.rest.get_vtxos(s, "").await?);
-        }
-        // New creating txids = candidate event txs. The indexer's arkTxid
-        // field is empty for some records (fresh preconfirmed outputs), so
-        // fall back to the outpoint txid: for offchain-created VTXOs that IS
-        // the creating virtual tx. Batch/boarding records may resolve to
-        // non-virtual txids; those simply fail to fetch and are skipped.
-        let mut new_txids: Vec<String> = Vec::new();
-        for r in &records {
-            let candidate = r
-                .ark_txid
-                .as_deref()
-                .filter(|t| t.len() == 64)
-                .map(str::to_string)
-                .unwrap_or_else(|| r.outpoint.txid.to_string());
-            let Ok(parsed) = candidate.parse::<Txid>() else { continue };
-            if self.seen_txs.contains(&parsed) {
-                continue;
-            }
-            if self.fetch_failures.get(&parsed).is_some_and(|n| *n >= 5) {
-                continue; // gave up: almost certainly not a virtual tx
-            }
-            new_txids.push(candidate);
-        }
-        if new_txids.is_empty() {
-            return Ok(());
-        }
-        // Fetch in one batch; if any txid isn't a virtual tx (e.g. a batch
-        // commitment from the outpoint fallback), retry one-by-one so a
-        // single bad id doesn't hide real events. Only mark txids seen when
-        // they were actually fetched — the indexer can serve the VTXO record
-        // before the virtual tx, and a poisoned seen-set loses events forever
-        // (that was the divergent-clients bug).
-        let mut fetched: Vec<bitcoin::Psbt> = Vec::new();
-        let mut failed: Vec<String> = Vec::new();
-        match self.rest.get_virtual_txs(&new_txids).await {
-            Ok(txs) => fetched = txs,
-            Err(_) => {
-                for id in &new_txids {
-                    match self.rest.get_virtual_txs(&[id.clone()]).await {
-                        Ok(mut txs) => fetched.append(&mut txs),
-                        Err(_) => failed.push(id.clone()),
+        let mut balances = [0u64; 4];
+        for record in spendable {
+            for (id, amount) in &record.assets {
+                for (direction, asset_id) in asset_ids.iter().enumerate() {
+                    if id == &asset_id.to_string() {
+                        balances[direction] = balances[direction].saturating_add(*amount);
+                        self.issuance_visible = true;
                     }
                 }
             }
         }
-        // The batch can also partially succeed; index what we have and retry
-        // the rest next poll.
-        let mut fetched_ids: HashSet<Txid> = fetched
-            .iter()
-            .map(|p| p.unsigned_tx.compute_txid())
-            .collect();
-        if !failed.is_empty() || fetched_ids.len() < new_txids.len() {
-            // Anything not fetched stays unseen.
-        }
-        for id in &new_txids {
-            if let Ok(txid) = id.parse::<Txid>() {
-                if fetched_ids.remove(&txid) {
-                    self.seen_txs.insert(txid);
-                } else {
-                    *self.fetch_failures.entry(txid).or_insert(0) += 1;
+        self.move_balances = balances;
+    }
+
+    async fn discover_move_assets(&mut self, spendable: &[VtxoRecord]) -> Result<()> {
+        let mut candidates = HashSet::new();
+        for record in spendable {
+            for (id, amount) in &record.assets {
+                let Some(asset_id) = txbuild::parse_asset_id_pub(id) else {
+                    continue;
+                };
+                if *amount > 0 && asset_id.group_index < 4 {
+                    candidates.insert(asset_id.txid);
                 }
             }
         }
-        let txs = fetched;
-        let my_pk = self.keys.owner_pk();
-        let my_pk_bytes = my_pk.serialize();
-        let master_pk_bytes = self.master.owner_pk().serialize();
-        for psbt in &txs {
-            let tx = &psbt.unsigned_tx;
-            let txid = tx.compute_txid();
-            let has_asset_packet = tx
-                .output
-                .iter()
-                .any(|o| ark_core::extension::is_extension(&o.script_pubkey));
-            // Attribute by input ownership: the signer's x-only pubkey is in
-            // the PSBT's tap_script_sigs keys (and/or final witness). The
-            // master key also counts as "us" (game-key funding sends).
-            let signed_by = |pk: &[u8; 32]| {
-                psbt.inputs.iter().any(|inp| {
-                    inp.tap_script_sigs.keys().any(|(k, _)| k.serialize() == *pk)
-                        || inp.final_script_witness.as_ref().is_some_and(|w| {
-                            w.iter().any(|e| e.windows(32).any(|x| x == pk))
-                        })
-                })
-            };
-            let mine =
-                signed_by(&my_pk_bytes) || signed_by(&master_pk_bytes) || self.sent_txids.contains(&txid);
-            let side = if mine { 0 } else { 1 };
-            for payload in payloads_from_tx(tx) {
-                let Some(msg) = Msg::decode(&payload) else { continue };
-                // Once a match is adopted, ignore stray messages for others.
-                if let Some(tag) = self.match_tag {
-                    if msg.kind != Kind::Start && msg.match_tag != tag {
-                        continue;
-                    }
-                }
-                self.events.push(Event {
+        let own_script = self.player_script();
+        for txid in candidates {
+            if self.issuance_player_script(txid).await?.as_deref() == Some(own_script.as_str()) {
+                let asset_ids = std::array::from_fn(|group_index| AssetId {
                     txid,
-                    side,
-                    has_asset_packet,
-                    msg,
+                    group_index: group_index as u16,
                 });
+                self.move_assets = Some(asset_ids);
+                self.log_line(format!(
+                    "recovered move asset issuance {}",
+                    short_txid(&txid)
+                ));
+                break;
             }
         }
         Ok(())
     }
 
-    /// Host: look for a START event among ingested txs.
-    fn find_start(&self) -> Option<([u8; 8], ark_core::ArkAddress)> {
-        for e in &self.events {
-            if e.msg.kind != Kind::Start || e.side != 1 {
-                continue;
+    fn reconcile_next_sequence(&mut self) {
+        let Some(player) = self.player_id() else {
+            return;
+        };
+        let contiguous = canonical_moves(&self.events)
+            .get(&player)
+            .map_or(0, |moves| moves.len() as u32);
+        self.next_sequence = self.next_sequence.max(contiguous);
+    }
+
+    fn local_history_ready(&self) -> bool {
+        let Some(player) = self.player_id() else {
+            return false;
+        };
+        let Some(script) = self.registered_players.get(&player) else {
+            return false;
+        };
+        self.fully_scanned_player_scripts.contains(script)
+            && !self
+                .unresolved_player_outputs
+                .values()
+                .any(|record| record.script.eq_ignore_ascii_case(script))
+    }
+
+    async fn issue_move_assets(&mut self, spendable: &[VtxoRecord]) -> Result<()> {
+        let required = self.required_funding();
+        let selected = self.registration_inputs(spendable).ok_or_else(|| {
+            anyhow!(
+                "need BTC-only inputs totaling exactly {required} sats or leaving at least {} sats of change",
+                self.params.vtxo_min_sats
+            )
+        })?;
+
+        self.phase = Phase::Issuing;
+        self.sending = true;
+        let built = txbuild::build_move_asset_issuance_tx(
+            &self.keys,
+            &self.params,
+            &self.info,
+            self.game_address,
+            &selected,
+        );
+        let result = match built {
+            Ok((ark_tx, checkpoints, asset_ids)) => {
+                txbuild::prepare_tx(&self.keys, ark_tx, checkpoints)
+                    .map(|submission| (submission, asset_ids))
             }
-            let Ok(text) = String::from_utf8(e.msg.data.clone()) else {
-                continue;
-            };
-            let Ok(addr) = ark_core::ArkAddress::decode(text.trim()) else {
-                continue;
-            };
-            return Some((gamelog::txid_tag(&e.txid), addr));
+            Err(err) => Err(err),
+        };
+        self.sending = false;
+
+        let (submission, asset_ids) = result?;
+        let txid = submission.txid;
+        self.move_assets = Some(asset_ids);
+        self.registered_players.insert(txid, self.player_script());
+        self.move_balances = [txbuild::MOVE_SUPPLY; 4];
+        self.next_sequence = 0;
+        self.log_line(format!(
+            "issuance {} prepared; persisting before submission",
+            short_txid(&txid)
+        ));
+        self.pending_action = Some(PendingAction::UnknownIssuance {
+            submission,
+            asset_ids,
+        });
+        Ok(())
+    }
+
+    fn registration_inputs(&self, spendable: &[VtxoRecord]) -> Option<Vec<VtxoRecord>> {
+        let required = self.required_funding();
+        let minimum_change = self.params.vtxo_min_sats.max(1);
+        let mut candidates: Vec<_> = spendable
+            .iter()
+            .filter(|record| record.assets.is_empty())
+            .filter(|record| safe_wallet_input(record))
+            .filter(|record| {
+                !self
+                    .excluded_outpoints
+                    .contains(&record.outpoint.to_string())
+            })
+            .cloned()
+            .collect();
+
+        if let Some(record) = candidates
+            .iter()
+            .filter(|record| valid_registration_total(record.amount_sats, required, minimum_change))
+            .min_by_key(|record| record.amount_sats)
+        {
+            return Some(vec![record.clone()]);
+        }
+
+        candidates.sort_by_key(|record| std::cmp::Reverse(record.amount_sats));
+        let mut selected = Vec::new();
+        let mut total = 0u64;
+        for record in candidates {
+            total = total.saturating_add(record.amount_sats);
+            selected.push(record);
+            if valid_registration_total(total, required, minimum_change) {
+                return Some(selected);
+            }
         }
         None
     }
 
-    async fn adopt_start(&mut self, tag: [u8; 8], joiner: ark_core::ArkAddress) -> Result<()> {
-        self.match_tag = Some(tag);
-        self.opponent_addr = Some(joiner);
-        if !self.ensure_game_funded().await? {
-            self.log_line("START received; funding game key before ACK");
-            return Ok(()); // retry on next poll
-        }
-        let msg = Msg {
-            match_tag: tag,
-            seq: self.seq,
-            prev: self.last_sent_tag,
-            tick_ms: now_ms(),
-            kind: Kind::Ack,
-            data: vec![],
+    async fn sweep_wallet(&mut self, spendable: &[VtxoRecord], destination: &str) -> Result<()> {
+        let destination = destination.trim();
+        let expected_prefix = if self.params.network == bitcoin::Network::Bitcoin {
+            "ark1"
+        } else {
+            "tark1"
         };
-        let funding = self.chain_input().await?;
-        let (ark_tx, checkpoints) = txbuild::build_message_tx(
+        if !destination
+            .to_ascii_lowercase()
+            .starts_with(expected_prefix)
+        {
+            return Err(anyhow!(
+                "destination must be a {expected_prefix} address for {}",
+                self.params.network_name
+            ));
+        }
+        let recipient = ark_core::ArkAddress::decode(destination)
+            .map_err(|error| anyhow!("invalid destination Ark address: {error}"))?;
+        if recipient.server() != self.params.signer_pk {
+            return Err(anyhow!(
+                "destination belongs to a different Arkade operator"
+            ));
+        }
+        if recipient == self.player_address() {
+            return Err(anyhow!(
+                "destination must differ from this wallet; sweeping to self would merge the game carrier"
+            ));
+        }
+
+        let selected: Vec<_> = spendable
+            .iter()
+            .filter(|record| safe_wallet_input(record))
+            .filter(|record| {
+                !self
+                    .excluded_outpoints
+                    .contains(&record.outpoint.to_string())
+            })
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            return Err(anyhow!("no safely spendable VTXOs to sweep"));
+        }
+        if selected.len() > 20 {
+            return Err(anyhow!(
+                "wallet has {} spendable VTXOs; sweep at most 20 after consolidating",
+                selected.len()
+            ));
+        }
+        let total: u64 = selected.iter().map(|record| record.amount_sats).sum();
+        self.log_line(format!(
+            "sweeping {total} sats and all carried assets to {destination}"
+        ));
+        self.sending = true;
+        let built =
+            txbuild::build_sweep_tx(&self.keys, &self.params, &self.info, &selected, recipient);
+        let result = match built {
+            Ok((ark_tx, checkpoints)) => txbuild::prepare_tx(&self.keys, ark_tx, checkpoints),
+            Err(error) => Err(error),
+        };
+        self.sending = false;
+
+        let submission = result?;
+        self.log_line(format!(
+            "wallet sweep {} prepared; persisting before submission",
+            short_txid(&submission.txid)
+        ));
+        self.pending_action = Some(PendingAction::UnknownSweep { submission });
+        Ok(())
+    }
+
+    async fn flush_one_move(&mut self, spendable: &[VtxoRecord]) {
+        let Some(direction) = self.pending_dirs.pop_front() else {
+            return;
+        };
+        if self.move_balances[direction as usize] == 0 {
+            self.log_line(format!(
+                "no {} assets left",
+                crate::game::DIRECTIONS[direction as usize].to_ascii_uppercase()
+            ));
+            return;
+        }
+        let asset_id = self.move_assets.expect("checked")[direction as usize];
+        let asset_text = asset_id.to_string();
+        let Some(carrier) = spendable
+            .iter()
+            .filter(|record| safe_wallet_input(record))
+            .filter(|record| record.amount_sats == self.params.dust_sats)
+            .filter(|record| {
+                !self
+                    .excluded_outpoints
+                    .contains(&record.outpoint.to_string())
+            })
+            .filter(|record| {
+                record
+                    .assets
+                    .iter()
+                    .any(|(id, amount)| id == &asset_text && *amount > 0)
+            })
+            .max_by_key(|record| record.amount_sats)
+            .cloned()
+        else {
+            self.pending_dirs.push_front(direction);
+            self.log_line("waiting for the move asset carrier");
+            return;
+        };
+
+        self.sending = true;
+        let built = txbuild::build_move_burn_tx(
             &self.keys,
             &self.params,
             &self.info,
-            &[funding],
-            joiner,
-            self.params.dust_sats,
-            &msg.encode(),
-        )?;
-        self.send_raw(ark_tx, checkpoints).await?;
-        self.log_line("START received; ACK sent");
-        self.begin_match().await
-    }
+            &carrier,
+            asset_id,
+            self.next_sequence,
+        );
+        let result = match built {
+            Ok((ark_tx, checkpoints)) => txbuild::prepare_tx(&self.keys, ark_tx, checkpoints),
+            Err(err) => Err(err),
+        };
+        self.sending = false;
 
-    /// Joiner: the host's ACK for any START we ever sent (a crashed first
-    /// attempt may have finalized without our local state advancing).
-    fn find_ack(&mut self) -> bool {
-        let mut candidates: Vec<[u8; 8]> = self.match_tag.into_iter().collect();
-        let my_addr = self.my_address().encode();
-        for e in &self.events {
-            if e.msg.kind == Kind::Start
-                && e.side == 0
-                && String::from_utf8(e.msg.data.clone()).ok().as_deref() == Some(my_addr.as_str())
-            {
-                candidates.push(gamelog::txid_tag(&e.txid));
+        match result {
+            Ok(submission) => {
+                let txid = submission.txid;
+                self.log_line(format!(
+                    "move {} prepared; persisting before submission",
+                    short_txid(&txid)
+                ));
+                self.pending_action = Some(PendingAction::UnknownMove {
+                    submission,
+                    direction,
+                    sequence: self.next_sequence,
+                });
+            }
+            Err(err) => {
+                self.pending_dirs.push_front(direction);
+                self.handle_send_error("move", &err);
             }
         }
-        for e in &self.events {
-            if e.msg.kind != Kind::Ack || e.side != 1 {
-                continue;
-            }
-            if !candidates.contains(&e.msg.match_tag) {
-                continue;
-            }
-            self.match_tag = Some(e.msg.match_tag);
-            return true;
-        }
-        false
     }
 
-    async fn begin_match(&mut self) -> Result<()> {
-        self.sim = Some(Sim::new());
-        self.phase = Phase::Arming;
-        self.log_line("handshake complete; arming…");
+    fn complete_move(&mut self, direction: u8, sequence: u32, txid: Txid) {
+        self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
+        self.move_balances[direction as usize] =
+            self.move_balances[direction as usize].saturating_sub(1);
+        self.log_line(format!(
+            "burned {} #{} in {}",
+            crate::game::DIRECTIONS[direction as usize].to_ascii_uppercase(),
+            sequence.saturating_add(1),
+            short_txid(&txid)
+        ));
+    }
+
+    async fn resume_pending(&mut self, spendable: &[VtxoRecord]) {
+        let Some(action) = self.pending_action.clone() else {
+            return;
+        };
+        let observed = match &action {
+            PendingAction::Issuance { asset_ids, .. } => spendable.iter().any(|record| {
+                record
+                    .assets
+                    .iter()
+                    .any(|(id, _)| asset_ids.iter().any(|asset| id == &asset.to_string()))
+            }),
+            PendingAction::Move { pending, .. } => {
+                self.events.iter().any(|event| event.txid == pending.txid)
+                    || self.transaction_is_indexed(pending.txid).await
+            }
+            PendingAction::UnknownIssuance { asset_ids, .. } => spendable.iter().any(|record| {
+                record
+                    .assets
+                    .iter()
+                    .any(|(id, _)| asset_ids.iter().any(|asset| id == &asset.to_string()))
+            }),
+            PendingAction::UnknownMove { submission, .. } => {
+                self.events
+                    .iter()
+                    .any(|event| event.txid == submission.txid)
+                    || self.transaction_is_indexed(submission.txid).await
+            }
+            PendingAction::Sweep { pending } => self.transaction_is_indexed(pending.txid).await,
+            PendingAction::UnknownSweep { submission } => {
+                self.transaction_is_indexed(submission.txid).await
+            }
+        };
+        if observed {
+            self.finish_pending(action, false);
+            return;
+        }
+
+        if matches!(
+            action,
+            PendingAction::UnknownIssuance { .. }
+                | PendingAction::UnknownMove { .. }
+                | PendingAction::UnknownSweep { .. }
+        ) {
+            self.resume_unknown(action).await;
+            return;
+        }
+
+        let pending = match &action {
+            PendingAction::Issuance { pending, .. }
+            | PendingAction::Move { pending, .. }
+            | PendingAction::Sweep { pending } => Some(pending),
+            PendingAction::UnknownIssuance { .. }
+            | PendingAction::UnknownMove { .. }
+            | PendingAction::UnknownSweep { .. } => None,
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        self.sending = true;
+        let result = txbuild::finalize_pending(&self.keys, &self.rest, pending).await;
+        self.sending = false;
+        match result {
+            Ok(()) => self.finish_pending(action, true),
+            Err(err) => self.report_error("pending finalization", &err),
+        }
+    }
+
+    async fn resume_unknown(&mut self, action: PendingAction) {
+        let submission = match &action {
+            PendingAction::UnknownIssuance { submission, .. }
+            | PendingAction::UnknownMove { submission, .. }
+            | PendingAction::UnknownSweep { submission } => submission,
+            _ => return,
+        };
+        self.sending = true;
+        let result =
+            txbuild::retry_unknown_submission(&self.keys, &self.params, &self.rest, submission)
+                .await;
+        self.sending = false;
+
+        match result {
+            Ok(txbuild::RunTxStatus::Finalized(_)) => self.finish_pending(action, true),
+            Ok(txbuild::RunTxStatus::Pending(pending)) => {
+                self.pending_action = Some(match action {
+                    PendingAction::UnknownIssuance { asset_ids, .. } => {
+                        PendingAction::Issuance { pending, asset_ids }
+                    }
+                    PendingAction::UnknownMove {
+                        direction,
+                        sequence,
+                        ..
+                    } => PendingAction::Move {
+                        pending,
+                        direction,
+                        sequence,
+                    },
+                    PendingAction::UnknownSweep { .. } => PendingAction::Sweep { pending },
+                    _ => return,
+                });
+            }
+            Ok(txbuild::RunTxStatus::SubmissionUnknown(submission)) => {
+                self.pending_action = Some(match action {
+                    PendingAction::UnknownIssuance { asset_ids, .. } => {
+                        PendingAction::UnknownIssuance {
+                            submission,
+                            asset_ids,
+                        }
+                    }
+                    PendingAction::UnknownMove {
+                        direction,
+                        sequence,
+                        ..
+                    } => PendingAction::UnknownMove {
+                        submission,
+                        direction,
+                        sequence,
+                    },
+                    PendingAction::UnknownSweep { .. } => {
+                        PendingAction::UnknownSweep { submission }
+                    }
+                    _ => return,
+                });
+            }
+            Err(err) => self.report_error("submission recovery", &err),
+        }
+    }
+
+    fn finish_pending(&mut self, action: PendingAction, optimistic_balance: bool) {
+        match action {
+            PendingAction::Issuance { pending, asset_ids } => {
+                self.move_assets = Some(asset_ids);
+                self.registered_players
+                    .insert(pending.txid, self.player_script());
+                self.log_line(format!("issuance {} finalized", short_txid(&pending.txid)));
+            }
+            PendingAction::Move {
+                pending,
+                direction,
+                sequence,
+            } => {
+                if optimistic_balance {
+                    self.complete_move(direction, sequence, pending.txid);
+                } else {
+                    self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
+                    self.log_line(format!("move {} finalized", short_txid(&pending.txid)));
+                }
+            }
+            PendingAction::UnknownIssuance {
+                submission,
+                asset_ids,
+            } => {
+                let txid = submission.txid;
+                self.move_assets = Some(asset_ids);
+                self.registered_players.insert(txid, self.player_script());
+                self.log_line(format!(
+                    "issuance {} appeared in indexer",
+                    short_txid(&txid)
+                ));
+            }
+            PendingAction::UnknownMove {
+                submission,
+                direction,
+                sequence,
+            } => {
+                let txid = submission.txid;
+                if optimistic_balance {
+                    self.complete_move(direction, sequence, txid);
+                } else {
+                    self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
+                    self.log_line(format!("move {} appeared in indexer", short_txid(&txid)));
+                }
+            }
+            PendingAction::Sweep { pending } => {
+                self.log_line(format!(
+                    "wallet sweep {} finalized",
+                    short_txid(&pending.txid)
+                ));
+            }
+            PendingAction::UnknownSweep { submission } => {
+                self.log_line(format!(
+                    "wallet sweep {} appeared in indexer",
+                    short_txid(&submission.txid)
+                ));
+            }
+        }
+        self.pending_action = None;
+    }
+
+    async fn transaction_is_indexed(&self, txid: Txid) -> bool {
+        self.rest
+            .get_virtual_txs(&[txid.to_string()])
+            .await
+            .is_ok_and(|txs| {
+                txs.into_iter()
+                    .any(|psbt| psbt.unsigned_tx.compute_txid() == txid)
+            })
+    }
+
+    fn handle_send_error(&mut self, action: &str, err: &anyhow::Error) {
+        let text = format!("{err:#}");
+        if let Some(outpoint) = extract_spent_outpoint(&text) {
+            self.excluded_outpoints.insert(outpoint);
+        }
+        self.report_error(action, err);
+    }
+
+    fn report_error(&mut self, action: &str, err: &anyhow::Error) {
+        let text = format!("{action}: {err:#}");
+        if self.last_error.as_deref() != Some(text.as_str()) {
+            self.log_line(text.clone());
+            self.last_error = Some(text);
+        }
+    }
+
+    fn clear_error(&mut self) {
+        self.last_error = None;
+    }
+
+    async fn refresh_game(&mut self) -> Result<()> {
+        let periodic_full = self.game_sync_count % 250 == 0;
+        let new_players = self
+            .refresh_registrations(!self.initial_registry_sync || periodic_full)
+            .await?;
+        let accepted_moves = self
+            .refresh_player_moves(!self.initial_player_sync || periodic_full || new_players > 0)
+            .await?;
+        self.initial_registry_sync = true;
+        self.initial_player_sync = true;
+        self.game_sync_count = self.game_sync_count.wrapping_add(1);
+        self.last_sync_ms = now_ms();
+        if new_players > 0 {
+            self.log_line(format!("discovered {new_players} new players"));
+        }
+        if accepted_moves > 0 {
+            self.log_line(format!("synced {accepted_moves} protocol burns"));
+        }
+        self.reconcile_next_sequence();
         Ok(())
     }
 
-    /// Rebuild sim inputs from the ordered log and run them.
-    fn rebuild_sim_inputs(&self) -> Vec<Input> {
-        let Some(tag) = self.match_tag else { return Vec::new() };
-        let events: Vec<Event> = self
-            .events
-            .iter()
-            .filter(|e| e.msg.match_tag == tag)
+    async fn refresh_registrations(&mut self, force_full: bool) -> Result<u32> {
+        let candidates = self.registry_records_to_check(force_full).await?;
+        for record in &candidates {
+            self.unresolved_registry_outputs
+                .entry(record.outpoint)
+                .or_insert_with(|| record.clone());
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut records_by_txid: HashMap<Txid, Vec<VtxoRecord>> = HashMap::new();
+        for record in &candidates {
+            records_by_txid
+                .entry(record.outpoint.txid)
+                .or_default()
+                .push(record.clone());
+        }
+        let txids: Vec<_> = records_by_txid.keys().copied().collect();
+        let txs = self.fetch_txs(&txids).await;
+        let mut new_players = 0u32;
+
+        for (txid, records) in records_by_txid {
+            let Some(psbt) = txs.get(&txid) else {
+                continue;
+            };
+            let matching_records: Vec<_> = records
+                .iter()
+                .filter(|record| record.outpoint.vout == 0)
+                .collect();
+            let player_script = registration_player_script(
+                &psbt.unsigned_tx,
+                &self.game_script,
+                self.params.dust_sats,
+            );
+            let Some(player_script) = player_script else {
+                self.invalid_registrations.insert(txid);
+                self.mark_registry_outputs_seen(&records);
+                continue;
+            };
+            if matching_records.len() != 1 || !matching_records[0].assets.is_empty() {
+                self.invalid_registrations.insert(txid);
+                self.mark_registry_outputs_seen(&records);
+                continue;
+            }
+            self.invalid_registrations.remove(&txid);
+            if self
+                .registered_players
+                .insert(txid, player_script)
+                .is_none()
+            {
+                new_players = new_players.saturating_add(1);
+            }
+            self.mark_registry_outputs_seen(&records);
+        }
+
+        Ok(new_players)
+    }
+
+    async fn registry_records_to_check(&self, force_full: bool) -> Result<Vec<VtxoRecord>> {
+        let mut index = 1;
+        let mut records: Vec<_> = self.unresolved_registry_outputs.values().cloned().collect();
+        let mut collected: HashSet<_> = self.unresolved_registry_outputs.keys().copied().collect();
+        loop {
+            let page = self
+                .rest
+                .get_vtxos_page(&self.game_script, "", INDEX_PAGE_SIZE, index)
+                .await?;
+            let page_was_known = !page.vtxos.is_empty()
+                && page.vtxos.iter().all(|record| {
+                    self.seen_registry_outputs.contains(&record.outpoint)
+                        || self
+                            .unresolved_registry_outputs
+                            .contains_key(&record.outpoint)
+                });
+            for record in page.vtxos {
+                if !self.seen_registry_outputs.contains(&record.outpoint)
+                    && collected.insert(record.outpoint)
+                {
+                    records.push(record);
+                }
+            }
+            if (!force_full && self.initial_registry_sync && page_was_known)
+                || page.next <= page.current
+                || page.next <= 0
+                || page.current >= page.total
+            {
+                break;
+            }
+            index = page.next;
+        }
+        Ok(records)
+    }
+
+    fn mark_registry_outputs_seen(&mut self, records: &[VtxoRecord]) {
+        for record in records {
+            self.seen_registry_outputs.insert(record.outpoint);
+            self.unresolved_registry_outputs.remove(&record.outpoint);
+        }
+    }
+
+    async fn refresh_player_moves(&mut self, force_full: bool) -> Result<u32> {
+        let (candidates, fully_scanned) = self.player_records_to_check(force_full).await?;
+        for record in &candidates {
+            self.unresolved_player_outputs
+                .entry(record.outpoint)
+                .or_insert_with(|| record.clone());
+        }
+        if candidates.is_empty() {
+            self.fully_scanned_player_scripts.extend(fully_scanned);
+            return Ok(0);
+        }
+
+        let mut records_by_txid: HashMap<Txid, Vec<VtxoRecord>> = HashMap::new();
+        for record in &candidates {
+            records_by_txid
+                .entry(record.outpoint.txid)
+                .or_default()
+                .push(record.clone());
+        }
+        let txids: Vec<_> = records_by_txid.keys().copied().collect();
+        let txs = self.fetch_txs(&txids).await;
+        let mut accepted = 0u32;
+
+        for (txid, records) in records_by_txid {
+            let Some(psbt) = txs.get(&txid) else {
+                continue;
+            };
+            let Some(burn) = move_burn_from_tx(&psbt.unsigned_tx) else {
+                self.mark_player_outputs_seen(&records);
+                continue;
+            };
+            let player_script = match self.issuance_player_script(burn.asset_id.txid).await {
+                Ok(Some(script)) => script,
+                Ok(None) => {
+                    self.mark_player_outputs_seen(&records);
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let player_outputs: Vec<_> = psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .enumerate()
+                .filter(|(_, output)| {
+                    output.script_pubkey.to_hex_string() == player_script
+                        && output.value.to_sat() > 0
+                })
+                .collect();
+            let canonical_carrier = player_outputs.len() == 1
+                && player_outputs[0].0 == 0
+                && player_outputs[0].1.value.to_sat() == self.params.dust_sats;
+            let assets_stay_with_player = burn
+                .preserved_output_indexes
+                .iter()
+                .all(|index| *index == 0);
+            let indexed_carrier = records.iter().any(|record| {
+                record.outpoint.vout == 0
+                    && record.amount_sats == self.params.dust_sats
+                    && record.script.eq_ignore_ascii_case(&player_script)
+            });
+            if !canonical_carrier || !assets_stay_with_player || !indexed_carrier {
+                self.mark_player_outputs_seen(&records);
+                continue;
+            }
+
+            if self.seen_move_txs.insert(txid) {
+                self.events.push(MoveEvent {
+                    txid,
+                    player: burn.asset_id.txid,
+                    sequence: burn.receipt.sequence,
+                    direction: burn.asset_id.group_index as u8,
+                });
+                accepted = accepted.saturating_add(1);
+            }
+            self.mark_player_outputs_seen(&records);
+        }
+
+        self.fully_scanned_player_scripts.extend(fully_scanned);
+        Ok(accepted)
+    }
+
+    async fn player_records_to_check(
+        &self,
+        force_full: bool,
+    ) -> Result<(Vec<VtxoRecord>, Vec<String>)> {
+        let scripts: Vec<_> = self
+            .registered_players
+            .values()
             .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
-        let ordered = order_events(events);
-        let mut inputs = Vec::new();
-        for e in &ordered {
-            match e.msg.kind {
-                Kind::Move => {
-                    for &dir in &e.msg.data {
-                        inputs.push(Input::Move {
-                            side: e.side as usize,
-                            dir,
-                        });
+        let mut records: Vec<_> = self.unresolved_player_outputs.values().cloned().collect();
+        let mut collected: HashSet<_> = self.unresolved_player_outputs.keys().copied().collect();
+        let mut fully_scanned = Vec::new();
+
+        for scripts in scripts.chunks(PLAYER_SCRIPT_BATCH_SIZE) {
+            let scan_all = force_full
+                || scripts
+                    .iter()
+                    .any(|script| !self.fully_scanned_player_scripts.contains(script));
+            let mut index = 1;
+            loop {
+                let page = self
+                    .rest
+                    .get_vtxos_page_many(scripts, "", INDEX_PAGE_SIZE, index)
+                    .await?;
+                let page_was_known = !page.vtxos.is_empty()
+                    && page.vtxos.iter().all(|record| {
+                        self.seen_player_outputs.contains(&record.outpoint)
+                            || self
+                                .unresolved_player_outputs
+                                .contains_key(&record.outpoint)
+                    });
+                for record in page.vtxos {
+                    if !self.seen_player_outputs.contains(&record.outpoint)
+                        && collected.insert(record.outpoint)
+                    {
+                        records.push(record);
                     }
                 }
-                Kind::Fire => inputs.push(Input::Fire {
-                    side: e.side as usize,
-                }),
-                _ => {}
+                if (!scan_all && self.initial_player_sync && page_was_known)
+                    || page.next <= page.current
+                    || page.next <= 0
+                    || page.current >= page.total
+                {
+                    break;
+                }
+                index = page.next;
+            }
+            if scan_all {
+                fully_scanned.extend_from_slice(scripts);
             }
         }
-        inputs
+        Ok((records, fully_scanned))
     }
 
-    async fn advance_sim(&mut self) -> Result<()> {
-        if self.sim.is_none() {
-            return Ok(());
+    fn mark_player_outputs_seen(&mut self, records: &[VtxoRecord]) {
+        for record in records {
+            self.seen_player_outputs.insert(record.outpoint);
+            self.unresolved_player_outputs.remove(&record.outpoint);
         }
-        let inputs = self.rebuild_sim_inputs();
-        self.sim_inputs = inputs.clone();
-        // Re-run from scratch: cheap at this scale, immune to late events.
-        let mut fresh = Sim::new();
-        fresh.run(&inputs);
-        if let SimPhase::Done { winner } = fresh.phase {
-            if matches!(self.phase, Phase::Playing) {
-                self.phase = Phase::Done {
-                    winner,
-                    verified: false,
-                };
-                let hash = fresh.state_hash();
-                self.log_line(format!("match over: player {winner} wins; sending END"));
-                // Best-effort END; failure leaves the match recorded anyway.
-                if !self.sending {
-                    let _ = self.send_end(hash).await;
+    }
+
+    async fn fetch_txs(&self, txids: &[Txid]) -> HashMap<Txid, bitcoin::Psbt> {
+        let mut out = HashMap::new();
+        for chunk in txids.chunks(40) {
+            let ids: Vec<String> = chunk.iter().map(ToString::to_string).collect();
+            match self.rest.get_virtual_txs(&ids).await {
+                Ok(txs) => {
+                    for psbt in txs {
+                        out.insert(psbt.unsigned_tx.compute_txid(), psbt);
+                    }
+                }
+                Err(_) => {
+                    for id in ids {
+                        if let Ok(txs) = self.rest.get_virtual_txs(&[id]).await {
+                            for psbt in txs {
+                                out.insert(psbt.unsigned_tx.compute_txid(), psbt);
+                            }
+                        }
+                    }
                 }
             }
         }
-        // Verify against the opponent's END: matching state hashes mean both
-        // sides replayed to the identical outcome.
-        if let Phase::Done { winner, verified } = self.phase {
-            if !verified {
-                let my_hash = Some(fresh.state_hash());
-                let ordered: Vec<Event> = self
-                    .events
-                    .iter()
-                    .filter(|e| Some(e.msg.match_tag) == self.match_tag)
-                    .cloned()
-                    .collect();
-                let opp_end_ok = ordered.iter().any(|e| {
-                    e.side == 1
-                        && e.msg.kind == Kind::End
-                        && e.msg.data.len() == 8
-                        && Some(u64::from_le_bytes(e.msg.data[..8].try_into().unwrap()))
-                            == my_hash
-                });
-                if opp_end_ok {
-                    self.phase = Phase::Done {
-                        winner,
-                        verified: true,
+        out
+    }
+
+    async fn issuance_player_script(&mut self, txid: Txid) -> Result<Option<String>> {
+        if let Some(script) = self.registered_players.get(&txid) {
+            return Ok(Some(script.clone()));
+        }
+        if self.invalid_registrations.contains(&txid) {
+            return Ok(None);
+        }
+        let txs = self.rest.get_virtual_txs(&[txid.to_string()]).await?;
+        let psbt = txs
+            .into_iter()
+            .find(|psbt| psbt.unsigned_tx.compute_txid() == txid)
+            .ok_or_else(|| anyhow!("player registration {txid} is not indexed yet"))?;
+        let player_script =
+            registration_player_script(&psbt.unsigned_tx, &self.game_script, self.params.dust_sats);
+        if let Some(script) = &player_script {
+            self.registered_players.insert(txid, script.clone());
+        } else {
+            self.invalid_registrations.insert(txid);
+        }
+        Ok(player_script)
+    }
+
+    fn player_id(&self) -> Option<Txid> {
+        self.move_assets.map(|assets| assets[0].txid)
+    }
+
+    fn player_snapshots(&self) -> Vec<PlayerSnapshot> {
+        let mut streams = canonical_moves(&self.events);
+        for player in self.registered_players.keys() {
+            streams.entry(*player).or_default();
+        }
+        if let Some(me) = self.player_id() {
+            streams.entry(me).or_default();
+        }
+        let me = self.player_id();
+        streams
+            .into_iter()
+            .map(|(id, moves)| {
+                let mut state = PlayerState::default();
+                for direction in moves {
+                    state.apply(direction);
+                }
+                PlayerSnapshot {
+                    id: id.to_string(),
+                    x: state.x,
+                    y: state.y,
+                    moves: state.moves,
+                    laps: state.laps,
+                    is_me: Some(id) == me,
+                }
+            })
+            .collect()
+    }
+
+    fn pending_txid(&self) -> Option<String> {
+        self.pending_action.as_ref().map(|action| match action {
+            PendingAction::Issuance { pending, .. }
+            | PendingAction::Move { pending, .. }
+            | PendingAction::Sweep { pending } => pending.txid.to_string(),
+            PendingAction::UnknownIssuance { submission, .. }
+            | PendingAction::UnknownMove { submission, .. }
+            | PendingAction::UnknownSweep { submission } => submission.txid.to_string(),
+        })
+    }
+
+    fn wallet_action(&self) -> &'static str {
+        match self.pending_action {
+            Some(PendingAction::Sweep { .. }) => "finalizing-sweep",
+            Some(PendingAction::UnknownSweep { .. }) => "recovering-sweep",
+            Some(PendingAction::Issuance { .. }) | Some(PendingAction::Move { .. }) => {
+                "finalizing-game-tx"
+            }
+            Some(PendingAction::UnknownIssuance { .. })
+            | Some(PendingAction::UnknownMove { .. }) => "recovering-game-tx",
+            None if self.sending => "submitting",
+            None => "idle",
+        }
+    }
+
+    fn wallet_snapshots(&self) -> Vec<WalletVtxoSnapshot> {
+        let now = (now_ms() / 1_000) as i64;
+        let mut records: Vec<_> =
+            self.wallet_records
+                .iter()
+                .map(|record| {
+                    let status = if record.is_unrolled {
+                        "unrolled"
+                    } else if record.is_swept {
+                        "swept"
+                    } else if record.is_spent {
+                        "spent"
+                    } else if record.amount_sats < self.params.dust_sats
+                        || record.expires_at.is_some_and(|expires| expires <= now)
+                    {
+                        "recoverable"
+                    } else if record.expires_at.is_some_and(|expires| {
+                        expires <= now.saturating_add(MIN_INPUT_LIFETIME_SECS)
+                    }) {
+                        "expiring"
+                    } else if record.is_preconfirmed {
+                        "preconfirmed"
+                    } else {
+                        "confirmed"
                     };
-                    self.log_line("opponent END matches local replay — verified");
-                }
-            }
-        }
-        self.sim = Some(fresh);
-        Ok(())
+                    WalletVtxoSnapshot {
+                        outpoint: record.outpoint.to_string(),
+                        amount: record.amount_sats,
+                        status: status.to_string(),
+                        assets: record
+                            .assets
+                            .iter()
+                            .map(|(asset_id, amount)| WalletAssetSnapshot {
+                                asset_id: asset_id.clone(),
+                                amount: *amount,
+                            })
+                            .collect(),
+                        expires_at: record.expires_at,
+                        spent_by: record.spent_by.clone(),
+                    }
+                })
+                .collect();
+        records.sort_by(|left, right| left.outpoint.cmp(&right.outpoint));
+        records
     }
 
     pub fn snapshot(&self, version: &str) -> Snapshot {
-        let (players, bullets, ammo, sim_phase) = match &self.sim {
-            Some(sim) => {
-                let phase = match sim.phase {
-                    SimPhase::Playing => "playing",
-                    SimPhase::Done { .. } => "done",
-                };
-                (
-                    Some(sim.pos.map(|(x, y)| [x, y])),
-                    sim.bullets.iter().map(|b| [b.x, b.y]).collect::<Vec<_>>(),
-                    Some(sim.ammo),
-                    phase,
-                )
-            }
-            None => (None, Vec::new(), None, "idle"),
-        };
-        let (phase, winner, verified) = match self.phase {
-            Phase::Idle => ("idle", None, false),
-            Phase::Hosting => ("hosting", None, false),
-            Phase::JoinFunding => ("join-funding", None, false),
-            Phase::JoinSent => ("join-sent", None, false),
-            Phase::Arming => ("arming", None, false),
-            Phase::Playing => ("playing", None, false),
-            Phase::Done { winner, verified } => ("done", Some(winner), verified),
-        };
         Snapshot {
-            network: match self.params.network {
-                bitcoin::Network::Bitcoin => "mainnet".to_string(),
-                _ => "signet".to_string(),
-            },
             version: version.to_string(),
-            phase: phase.to_string(),
-            sim_phase: sim_phase.to_string(),
-            address: self.funding_address().encode(),
-            game_address: self.in_match().then(|| self.my_address().encode()),
-            opponent: self.opponent_addr.map(|a| a.encode()),
-            match_id: self.match_tag.map(|t| hex8(&t)),
-            players,
-            bullets,
-            ammo,
-            winner,
-            verified,
-            my_bullet_asset: self.my_bullet_asset.map(|a| a.to_string()),
-            sending: self.sending,
+            server: self.rest.base().to_string(),
+            operator_version: self.params.server_version.clone(),
+            signer: self.params.signer_pk.to_string(),
+            network: self.params.network_name.clone(),
+            phase: match self.phase {
+                Phase::FundWallet => "fund-wallet",
+                Phase::Issuing => "issuing",
+                Phase::Syncing => "syncing",
+                Phase::Playing => "playing",
+                Phase::OutOfMoves => "out-of-moves",
+            }
+            .to_string(),
+            address: self.player_address().encode(),
+            game_address: self.game_address(),
+            player_id: self.player_id().map(|id| id.to_string()),
             balance: self.balance_cache,
+            known_balance: self
+                .wallet_records
+                .iter()
+                .filter(|record| !record.is_spent && !record.is_swept && !record.is_unrolled)
+                .map(|record| record.amount_sats)
+                .sum(),
+            required_funding: self.required_funding(),
+            funding_ready: self.funding_ready,
+            registration_cost: self.params.dust_sats,
+            reusable_carrier: self.params.dust_sats,
+            move_balances: self.move_balances,
+            sending: self.sending,
+            pending: self.pending_action.is_some(),
+            pending_txid: self.pending_txid(),
+            wallet_action: self.wallet_action().to_string(),
+            wallet_vtxos: self.wallet_snapshots(),
+            queued: self.pending_dirs.len() as u32,
+            players: self.player_snapshots(),
+            maze_width: crate::game::MAZE_W,
+            maze_height: crate::game::MAZE_H,
+            walls: crate::game::walls(),
+            start: [crate::game::START.0, crate::game::START.1],
+            goal: [crate::game::GOAL.0, crate::game::GOAL.1],
             events: self.events.len() as u32,
+            wallet_sync_ms: self.wallet_sync_ms,
             last_sync_ms: self.last_sync_ms,
+            last_error: self.last_error.clone(),
             log: self.log.clone(),
         }
     }
 }
 
-/// UI snapshot. Plain serde struct so serde-wasm-bindgen produces a real JS
-/// object (serializing a serde_json::Value yields a JS Map instead — every
-/// field reads as undefined).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerSnapshot {
+    pub id: String,
+    pub x: i32,
+    pub y: i32,
+    pub moves: u32,
+    pub laps: u32,
+    pub is_me: bool,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletAssetSnapshot {
+    pub asset_id: String,
+    pub amount: u64,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletVtxoSnapshot {
+    pub outpoint: String,
+    pub amount: u64,
+    pub status: String,
+    pub assets: Vec<WalletAssetSnapshot>,
+    pub expires_at: Option<i64>,
+    pub spent_by: Option<String>,
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
-    pub network: String,
     pub version: String,
+    pub server: String,
+    pub operator_version: String,
+    pub signer: String,
+    pub network: String,
     pub phase: String,
-    pub sim_phase: String,
-    /// Master-key address: the funding target shown in the UI.
     pub address: String,
-    /// Per-match address (present while a match is active).
-    pub game_address: Option<String>,
-    pub opponent: Option<String>,
-    pub match_id: Option<String>,
-    pub players: Option<[[i32; 2]; 2]>,
-    pub bullets: Vec<[i32; 2]>,
-    pub ammo: Option<[u32; 2]>,
-    pub winner: Option<usize>,
-    pub verified: bool,
-    pub my_bullet_asset: Option<String>,
-    pub sending: bool,
+    pub game_address: String,
+    pub player_id: Option<String>,
     pub balance: u64,
+    pub known_balance: u64,
+    pub required_funding: u64,
+    pub funding_ready: bool,
+    pub registration_cost: u64,
+    pub reusable_carrier: u64,
+    pub move_balances: [u64; 4],
+    pub sending: bool,
+    pub pending: bool,
+    pub pending_txid: Option<String>,
+    pub wallet_action: String,
+    pub wallet_vtxos: Vec<WalletVtxoSnapshot>,
+    pub queued: u32,
+    pub players: Vec<PlayerSnapshot>,
+    pub maze_width: i32,
+    pub maze_height: i32,
+    pub walls: Vec<[i32; 2]>,
+    pub start: [i32; 2],
+    pub goal: [i32; 2],
     pub events: u32,
+    pub wallet_sync_ms: u64,
     pub last_sync_ms: u64,
+    pub last_error: Option<String>,
     pub log: Vec<String>,
 }
 
-pub fn hex8(tag: &[u8; 8]) -> String {
-    use bitcoin::hex::DisplayHex;
-    tag.to_lower_hex_string()
+fn pending_action_to_journal(action: &PendingAction) -> PendingJournalAction {
+    match action {
+        PendingAction::Issuance { pending, asset_ids } => PendingJournalAction::Issuance {
+            transaction: journal_transaction(
+                JournalStage::Finalizing,
+                pending.txid,
+                &pending.signed_ark,
+                &pending.checkpoints,
+                &pending.last_error,
+            ),
+            asset_ids: (*asset_ids).map(|asset| asset.to_string()),
+        },
+        PendingAction::Move {
+            pending,
+            direction,
+            sequence,
+        } => PendingJournalAction::Move {
+            transaction: journal_transaction(
+                JournalStage::Finalizing,
+                pending.txid,
+                &pending.signed_ark,
+                &pending.checkpoints,
+                &pending.last_error,
+            ),
+            direction: *direction,
+            sequence: *sequence,
+        },
+        PendingAction::UnknownIssuance {
+            submission,
+            asset_ids,
+        } => PendingJournalAction::Issuance {
+            transaction: journal_transaction(
+                JournalStage::Prepared,
+                submission.txid,
+                &submission.signed_ark,
+                &submission.checkpoints,
+                &submission.last_error,
+            ),
+            asset_ids: (*asset_ids).map(|asset| asset.to_string()),
+        },
+        PendingAction::UnknownMove {
+            submission,
+            direction,
+            sequence,
+        } => PendingJournalAction::Move {
+            transaction: journal_transaction(
+                JournalStage::Prepared,
+                submission.txid,
+                &submission.signed_ark,
+                &submission.checkpoints,
+                &submission.last_error,
+            ),
+            direction: *direction,
+            sequence: *sequence,
+        },
+        PendingAction::Sweep { pending } => PendingJournalAction::Sweep {
+            transaction: journal_transaction(
+                JournalStage::Finalizing,
+                pending.txid,
+                &pending.signed_ark,
+                &pending.checkpoints,
+                &pending.last_error,
+            ),
+        },
+        PendingAction::UnknownSweep { submission } => PendingJournalAction::Sweep {
+            transaction: journal_transaction(
+                JournalStage::Prepared,
+                submission.txid,
+                &submission.signed_ark,
+                &submission.checkpoints,
+                &submission.last_error,
+            ),
+        },
+    }
 }
 
-impl MatchApp {
-    /// Serializable match state for reload recovery. The event log itself is
-    /// NOT persisted: on reload it is re-ingested from the indexer (the
-    /// chains are the source of truth).
-    pub fn export_state(&self) -> serde_json::Value {
-        let phase = match self.phase {
-            Phase::Idle => "idle",
-            Phase::Hosting => "hosting",
-            Phase::JoinFunding => "join-funding",
-            Phase::JoinSent => "join-sent",
-            Phase::Arming => "arming",
-            Phase::Playing => "playing",
-            // Done replays to Done from the log on restore.
-            Phase::Done { .. } => "playing",
-        };
-        serde_json::json!({
-            "phase": phase,
-            "gameKey": self.game_key_hex(),
-            "matchTag": self.match_tag.map(|t| hex8(&t)),
-            "opponent": self.opponent_addr.map(|a| a.encode()),
-            "myBulletAsset": self.my_bullet_asset.map(|a| a.to_string()),
-            "seq": self.seq,
-            "sent": self.sent_txids.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+fn journal_transaction(
+    stage: JournalStage,
+    txid: Txid,
+    signed_ark: &Psbt,
+    checkpoints: &[Psbt],
+    last_error: &str,
+) -> JournalTransaction {
+    let base64 = base64::engine::general_purpose::STANDARD;
+    JournalTransaction {
+        stage,
+        txid: txid.to_string(),
+        signed_ark: base64.encode(signed_ark.serialize()),
+        checkpoints: checkpoints
+            .iter()
+            .map(|checkpoint| base64.encode(checkpoint.serialize()))
+            .collect(),
+        last_error: last_error.to_string(),
+    }
+}
+
+fn pending_action_from_journal(action: PendingJournalAction) -> Result<PendingAction> {
+    match action {
+        PendingJournalAction::Issuance {
+            transaction,
+            asset_ids,
+        } => {
+            let transaction = restore_transaction(transaction)?;
+            let txid = restored_transaction_txid(&transaction);
+            let asset_ids = restore_asset_ids(asset_ids, txid)?;
+            Ok(match transaction {
+                RestoredTransaction::Prepared(submission) => PendingAction::UnknownIssuance {
+                    submission,
+                    asset_ids,
+                },
+                RestoredTransaction::Finalizing(pending) => {
+                    PendingAction::Issuance { pending, asset_ids }
+                }
+            })
+        }
+        PendingJournalAction::Move {
+            transaction,
+            direction,
+            sequence,
+        } => {
+            if direction > crate::game::DIR_LEFT {
+                return Err(anyhow!("pending move has an invalid direction"));
+            }
+            Ok(match restore_transaction(transaction)? {
+                RestoredTransaction::Prepared(submission) => PendingAction::UnknownMove {
+                    submission,
+                    direction,
+                    sequence,
+                },
+                RestoredTransaction::Finalizing(pending) => PendingAction::Move {
+                    pending,
+                    direction,
+                    sequence,
+                },
+            })
+        }
+        PendingJournalAction::Sweep { transaction } => {
+            Ok(match restore_transaction(transaction)? {
+                RestoredTransaction::Prepared(submission) => {
+                    PendingAction::UnknownSweep { submission }
+                }
+                RestoredTransaction::Finalizing(pending) => PendingAction::Sweep { pending },
+            })
+        }
+    }
+}
+
+fn restore_transaction(transaction: JournalTransaction) -> Result<RestoredTransaction> {
+    let txid: Txid = transaction.txid.parse().context("parse pending txid")?;
+    let base64 = base64::engine::general_purpose::STANDARD;
+    let signed_ark = Psbt::deserialize(
+        &base64
+            .decode(&transaction.signed_ark)
+            .context("decode pending Ark PSBT")?,
+    )
+    .context("parse pending Ark PSBT")?;
+    if signed_ark.unsigned_tx.compute_txid() != txid {
+        return Err(anyhow!("pending Ark PSBT does not match its txid"));
+    }
+    if transaction.checkpoints.is_empty() || transaction.checkpoints.len() > 20 {
+        return Err(anyhow!(
+            "pending transaction must contain between 1 and 20 checkpoints"
+        ));
+    }
+    let checkpoints = transaction
+        .checkpoints
+        .iter()
+        .map(|checkpoint| {
+            let bytes = base64
+                .decode(checkpoint)
+                .context("decode pending checkpoint PSBT")?;
+            Psbt::deserialize(&bytes).context("parse pending checkpoint PSBT")
         })
+        .collect::<Result<Vec<_>>>()?;
+    if signed_ark.unsigned_tx.input.len() != checkpoints.len()
+        || checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.unsigned_tx.input.len() != 1)
+    {
+        return Err(anyhow!(
+            "pending transaction checkpoint count is inconsistent"
+        ));
     }
 
-    pub fn import_state(&mut self, v: &serde_json::Value) {
-        if let Some(key) = v.get("gameKey").and_then(|k| k.as_str()) {
-            if let Ok(keys) = Keys::from_hex(key) {
-                self.keys = keys;
-            }
+    Ok(match transaction.stage {
+        JournalStage::Prepared => RestoredTransaction::Prepared(txbuild::UnknownSubmission {
+            txid,
+            signed_ark,
+            checkpoints,
+            last_error: transaction.last_error,
+        }),
+        JournalStage::Finalizing => RestoredTransaction::Finalizing(txbuild::PendingFinalize {
+            txid,
+            signed_ark,
+            checkpoints,
+            last_error: transaction.last_error,
+        }),
+    })
+}
+
+fn restore_asset_ids(raw: [String; 4], txid: Txid) -> Result<[AssetId; 4]> {
+    let parsed = raw
+        .iter()
+        .map(|asset| {
+            txbuild::parse_asset_id_pub(asset)
+                .ok_or_else(|| anyhow!("pending issuance contains an invalid asset ID"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let assets: [AssetId; 4] = parsed
+        .try_into()
+        .map_err(|_| anyhow!("pending issuance requires four asset IDs"))?;
+    for (index, asset) in assets.iter().enumerate() {
+        if asset.txid != txid || asset.group_index != index as u16 {
+            return Err(anyhow!(
+                "pending issuance asset IDs do not match the issuance transaction"
+            ));
         }
-        let phase = v.get("phase").and_then(|p| p.as_str()).unwrap_or("idle");
-        self.phase = match phase {
-            "hosting" => Phase::Hosting,
-            "join-funding" => Phase::JoinFunding,
-            "join-sent" => Phase::JoinSent,
-            "arming" => Phase::Arming,
-            "playing" => Phase::Playing,
-            _ => Phase::Idle,
-        };
-        if let Some(tag) = v.get("matchTag").and_then(|t| t.as_str()) {
-            let decoded: Result<Vec<u8>, _> = bitcoin::hex::FromHex::from_hex(tag);
-            if let Ok(bytes) = decoded {
-                if bytes.len() == 8 {
-                    self.match_tag = Some(bytes[..8].try_into().unwrap());
-                }
-            }
-        }
-        if let Some(addr) = v.get("opponent").and_then(|a| a.as_str()) {
-            self.opponent_addr = ark_core::ArkAddress::decode(addr).ok();
-        }
-        if let Some(asset) = v.get("myBulletAsset").and_then(|a| a.as_str()) {
-            self.my_bullet_asset = asset.parse().ok();
-        }
-        if let Some(seq) = v.get("seq").and_then(|s| s.as_u64()) {
-            self.seq = seq as u32;
-        }
-        if let Some(sent) = v.get("sent").and_then(|s| s.as_array()) {
-            for t in sent.iter().filter_map(|t| t.as_str()) {
-                if let Ok(txid) = t.parse() {
-                    self.sent_txids.insert(txid);
-                }
-            }
-        }
-        if self.phase != Phase::Idle {
-            self.log_line("restored match state from local storage");
-        }
-        // A restored in-progress match gets a fresh sim; the log replays it.
-        if matches!(self.phase, Phase::Arming | Phase::Playing) {
-            self.sim = Some(Sim::new());
-        }
+    }
+    Ok(assets)
+}
+
+fn restored_transaction_txid(transaction: &RestoredTransaction) -> Txid {
+    match transaction {
+        RestoredTransaction::Prepared(submission) => submission.txid,
+        RestoredTransaction::Finalizing(pending) => pending.txid,
     }
 }
 
-/// Pull a "txid:vout already spent" outpoint out of an operator error body.
+fn pending_action_txid(action: &PendingAction) -> Txid {
+    match action {
+        PendingAction::Issuance { pending, .. }
+        | PendingAction::Move { pending, .. }
+        | PendingAction::Sweep { pending } => pending.txid,
+        PendingAction::UnknownIssuance { submission, .. }
+        | PendingAction::UnknownMove { submission, .. }
+        | PendingAction::UnknownSweep { submission } => submission.txid,
+    }
+}
+
+fn short_txid(txid: &Txid) -> String {
+    txid.to_string()[..8].to_string()
+}
+
+fn safe_wallet_input(record: &VtxoRecord) -> bool {
+    if record.is_swept || record.is_unrolled {
+        return false;
+    }
+    let now = (now_ms() / 1_000) as i64;
+    record
+        .expires_at
+        .is_some_and(|expires_at| expires_at > now.saturating_add(MIN_INPUT_LIFETIME_SECS))
+}
+
+fn valid_registration_total(total: u64, required: u64, minimum_change: u64) -> bool {
+    total == required || total >= required.saturating_add(minimum_change)
+}
+
+/// Recompute the registry address for an operator using Arkade's standard NUMS
+/// owner. This is exposed for the verification example and documentation.
+pub fn nums_registry_address(params: &ServerParams) -> Result<ark_core::ArkAddress> {
+    let nums = ark_core::UNSPENDABLE_KEY
+        .parse::<bitcoin::PublicKey>()
+        .context("parse Arkade NUMS key")?;
+    let owner = nums.inner.x_only_public_key().0;
+    let vtxo = ark_core::Vtxo::new_default(
+        &bitcoin::key::Secp256k1::new(),
+        params.signer_pk,
+        owner,
+        params.unilateral_exit_delay,
+        params.network,
+    )?;
+    Ok(vtxo.to_ark_address())
+}
+
+/// Pull a `txid:vout already spent` outpoint out of an operator error body.
 pub fn extract_spent_outpoint(text: &str) -> Option<String> {
     let idx = text.find("already spent")?;
-    let before = &text[..idx];
-    let token = before
+    let token = text[..idx]
         .split(|c: char| !c.is_ascii_hexdigit() && c != ':' && c != '.')
-        .filter(|t| !t.is_empty())
-        .last()?;
+        .rfind(|part| !part.is_empty())?;
     let (txid, vout) = token.split_once(':')?;
-    if txid.len() == 64 && txid.chars().all(|c| c.is_ascii_hexdigit()) && vout.parse::<u32>().is_ok() {
+    if txid.len() == 64
+        && txid.chars().all(|c| c.is_ascii_hexdigit())
+        && vout.parse::<u32>().is_ok()
+    {
         Some(token.to_string())
     } else {
         None
     }
 }
 
-/// Wall-clock unix milliseconds (browser clock).
 pub fn now_ms() -> u64 {
     #[cfg(target_arch = "wasm32")]
     {
@@ -1111,21 +1772,92 @@ pub fn now_ms() -> u64 {
     {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
+            .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+
+    fn test_psbt(byte: u8) -> Psbt {
+        Psbt::from_unsigned_tx(bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::from_byte_array([byte; 32]),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(330),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        })
+        .unwrap()
+    }
+
     #[test]
     fn extracts_spent_outpoint() {
         let txid = "a".repeat(64);
-        let body = format!("submit failed (400): {{\"message\":\"{txid}:2 already spent\"}}");
+        let body = format!("submit failed: {txid}:2 already spent");
         assert_eq!(
-            super::extract_spent_outpoint(&body).as_deref(),
+            extract_spent_outpoint(&body).as_deref(),
             Some(format!("{txid}:2").as_str())
         );
-        assert_eq!(super::extract_spent_outpoint("some other error"), None);
+    }
+
+    #[test]
+    fn hard_coded_address_has_expected_script() {
+        let address = ark_core::ArkAddress::decode(GAME_ADDRESS).unwrap();
+        assert_eq!(
+            address.to_p2tr_script_pubkey().to_hex_string(),
+            "51201bb845d8a4812365639aed19b3000d73fee6a8ed9f9e5da2bd7adf2c08659d4a"
+        );
+    }
+
+    #[test]
+    fn registration_total_never_creates_sub_minimum_change() {
+        assert!(valid_registration_total(660, 660, 330));
+        assert!(!valid_registration_total(700, 660, 330));
+        assert!(!valid_registration_total(989, 660, 330));
+        assert!(valid_registration_total(990, 660, 330));
+    }
+
+    #[test]
+    fn pending_journal_roundtrips_exact_psbts() {
+        let signed_ark = test_psbt(1);
+        let txid = signed_ark.unsigned_tx.compute_txid();
+        let action = PendingAction::UnknownMove {
+            submission: txbuild::UnknownSubmission {
+                txid,
+                signed_ark: signed_ark.clone(),
+                checkpoints: vec![test_psbt(2)],
+                last_error: "prepared".to_string(),
+            },
+            direction: crate::game::DIR_RIGHT,
+            sequence: 7,
+        };
+        let raw = serde_json::to_string(&pending_action_to_journal(&action)).unwrap();
+        let decoded: PendingJournalAction = serde_json::from_str(&raw).unwrap();
+        let restored = pending_action_from_journal(decoded).unwrap();
+        let PendingAction::UnknownMove {
+            submission,
+            direction,
+            sequence,
+        } = restored
+        else {
+            panic!("wrong restored pending action");
+        };
+        assert_eq!(submission.txid, txid);
+        assert_eq!(submission.signed_ark.serialize(), signed_ark.serialize());
+        assert_eq!(direction, crate::game::DIR_RIGHT);
+        assert_eq!(sequence, 7);
     }
 }

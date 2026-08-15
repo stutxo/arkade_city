@@ -6,29 +6,30 @@ export class App {
     free(): void;
     [Symbol.dispose](): void;
     address(): string;
-    /**
-     * Recovery export: the raw key hex. Anyone holding it can spend.
-     */
     exportKey(): string;
+    exportPending(): string;
     /**
-     * Load or generate the browser key and fetch server parameters.
+     * Recovery data includes the contract parameters needed to rediscover
+     * this tab's VTXOs after an operator signer or exit-delay rotation.
      */
-    static init(server_url?: string | null): Promise<App>;
+    exportRecovery(): string;
+    gameAddress(): string;
     /**
-     * "mainnet" or "signet" — known right after init, before any snapshot.
+     * Connect to one Arkade server and restore the supplied wallet key. The
+     * browser owns persistence so a failed network request cannot replace it.
      */
-    network(): string;
+    static init(server: string, secret_key?: string | null, pending_journal?: string | null): Promise<App>;
     /**
-     * The single serialized entry point.
-     *
-     * * `command`: "", "host", "join" (`arg` = host address), or "reset"
-     * * `dirs`: direction presses since the previous step (0=up 1=right
-     *   2=down 3=left) — each becomes one discrete step on-chain
-     * * `fires`: number of fire presses since the previous step
-     *
-     * Returns the JSON snapshot for rendering.
+     * Return local wallet/game state immediately, without waiting on the
+     * indexer. The browser uses this to render the restored wallet while the
+     * first network synchronization runs.
      */
-    step(command: string, arg: string, dirs: Uint8Array, fires: number): Promise<any>;
+    snapshot(): any;
+    /**
+     * Queue direction presses (0=up, 1=right, 2=down, 3=left), synchronize
+     * wallet/game state, and execute at most one sweep or move asset burn.
+     */
+    step(dirs: Uint8Array, sweep_address?: string | null): Promise<any>;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -38,9 +39,12 @@ export interface InitOutput {
     readonly __wbg_app_free: (a: number, b: number) => void;
     readonly app_address: (a: number, b: number) => void;
     readonly app_exportKey: (a: number, b: number) => void;
-    readonly app_init: (a: number, b: number) => number;
-    readonly app_network: (a: number, b: number) => void;
-    readonly app_step: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => number;
+    readonly app_exportPending: (a: number, b: number) => void;
+    readonly app_exportRecovery: (a: number, b: number) => void;
+    readonly app_gameAddress: (a: number, b: number) => void;
+    readonly app_init: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
+    readonly app_snapshot: (a: number, b: number) => void;
+    readonly app_step: (a: number, b: number, c: number, d: number, e: number) => number;
     readonly rustsecp256k1_v0_12_context_create: (a: number) => number;
     readonly rustsecp256k1_v0_12_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_12_default_error_callback_fn: (a: number, b: number) => void;
@@ -49,8 +53,8 @@ export interface InitOutput {
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;
     readonly rustsecp256k1_v0_10_0_default_illegal_callback_fn: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_3466: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_3468: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_4283: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_4285: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

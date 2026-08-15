@@ -1,107 +1,90 @@
-//! Game log protocol: OP_RETURN message codec, event collection from
-//! virtual transactions, and causal ordering of both players' chains.
+//! Registry and per-player move ledger.
 //!
-//! Wire format (`GM` magic, version 1):
-//! ```text
-//! "GM" | ver(1) | match(8) | seq(4 LE) | prev(8) | tick(8 LE ms) | kind(1) | data(n)
-//! ```
-//! `match`/`prev` are the first 8 bytes of the respective txid's internal
-//! byte order. `tick` is unix-ms at send time; the sim orders by causal
-//! (seq, prev) first, then tick, then txid — fully deterministic.
+//! A game-address output registers each issuance and its player script. Native
+//! asset burns are then discovered through that script. The burned asset
+//! identifies both the player (issuance txid) and direction (group index), and
+//! a compact receipt supplies deterministic player-local ordering.
 
+use ark_core::asset::AssetId;
+use bitcoin::hashes::Hash;
 use bitcoin::opcodes::all::OP_RETURN;
 use bitcoin::script::Instruction;
 use bitcoin::{Transaction, Txid};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 
-pub const MAGIC: &[u8; 2] = b"GM";
-pub const VERSION: u8 = 1;
-pub const HEADER_LEN: usize = 2 + 1 + 8 + 4 + 8 + 8 + 1;
+pub const GAME_ID: &str = "arkade-maze-v2";
+pub const RECEIPT_MAGIC: &[u8; 2] = b"AM";
+pub const RECEIPT_VERSION: u8 = 2;
+pub const RECEIPT_LEN: usize = 2 + 1 + 4;
+pub const MOVE_SUPPLY: u64 = 50;
+pub const PLAYER_ASSET_OUTPUT_INDEX: u16 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    Start,
-    Ack,
-    Move,
-    Fire,
-    End,
-}
-
-impl Kind {
-    fn from_u8(b: u8) -> Option<Self> {
-        match b {
-            0 => Some(Self::Start),
-            1 => Some(Self::Ack),
-            2 => Some(Self::Move),
-            3 => Some(Self::Fire),
-            4 => Some(Self::End),
-            _ => None,
-        }
-    }
-    fn to_u8(self) -> u8 {
-        match self {
-            Self::Start => 0,
-            Self::Ack => 1,
-            Self::Move => 2,
-            Self::Fire => 3,
-            Self::End => 4,
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetPacket {
+    pub groups: Vec<AssetPacketGroup>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Msg {
-    pub match_tag: [u8; 8],
-    pub seq: u32,
-    pub prev: [u8; 8],
-    pub tick_ms: u64,
-    pub kind: Kind,
-    pub data: Vec<u8>,
+pub struct AssetPacketGroup {
+    pub asset_id: Option<AssetId>,
+    pub has_control_asset: bool,
+    pub metadata: Option<Vec<(String, String)>>,
+    pub inputs: Vec<AssetAssignment>,
+    pub outputs: Vec<AssetAssignment>,
 }
 
-impl Msg {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + self.data.len());
-        out.extend_from_slice(MAGIC);
-        out.push(VERSION);
-        out.extend_from_slice(&self.match_tag);
-        out.extend_from_slice(&self.seq.to_le_bytes());
-        out.extend_from_slice(&self.prev);
-        out.extend_from_slice(&self.tick_ms.to_le_bytes());
-        out.push(self.kind.to_u8());
-        out.extend_from_slice(&self.data);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssetAssignment {
+    pub index: u16,
+    pub amount: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoveReceipt {
+    pub sequence: u32,
+}
+
+impl MoveReceipt {
+    pub fn encode(self) -> [u8; RECEIPT_LEN] {
+        let mut out = [0u8; RECEIPT_LEN];
+        out[..2].copy_from_slice(RECEIPT_MAGIC);
+        out[2] = RECEIPT_VERSION;
+        out[3..].copy_from_slice(&self.sequence.to_le_bytes());
         out
     }
 
     pub fn decode(raw: &[u8]) -> Option<Self> {
-        if raw.len() < HEADER_LEN || &raw[..2] != MAGIC || raw[2] != VERSION {
+        if raw.len() != RECEIPT_LEN || &raw[..2] != RECEIPT_MAGIC || raw[2] != RECEIPT_VERSION {
             return None;
         }
         Some(Self {
-            match_tag: raw[3..11].try_into().ok()?,
-            seq: u32::from_le_bytes(raw[11..15].try_into().ok()?),
-            prev: raw[15..23].try_into().ok()?,
-            tick_ms: u64::from_le_bytes(raw[23..31].try_into().ok()?),
-            kind: Kind::from_u8(raw[31])?,
-            data: raw[32..].to_vec(),
+            sequence: u32::from_le_bytes(raw[3..7].try_into().ok()?),
         })
     }
 }
 
-/// Short reference to a txid: first 8 bytes of its internal byte array.
-pub fn txid_tag(txid: &Txid) -> [u8; 8] {
-    use bitcoin::hashes::Hash;
-    txid.to_byte_array()[..8].try_into().expect("8 bytes")
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveEvent {
+    pub txid: Txid,
+    pub player: Txid,
+    pub sequence: u32,
+    pub direction: u8,
 }
 
-/// Extract all game payloads (plain OP_RETURN outputs) from a virtual tx.
-/// Extension (ARK-magic) outputs are skipped; asset packets are not game data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoveBurn {
+    pub receipt: MoveReceipt,
+    pub asset_id: AssetId,
+    pub preserved_output_indexes: Vec<u16>,
+}
+
+/// Extract non-extension OP_RETURN payloads from a virtual transaction.
 pub fn payloads_from_tx(tx: &Transaction) -> Vec<Vec<u8>> {
     tx.output
         .iter()
-        .filter(|o| o.value == bitcoin::Amount::ZERO)
-        .filter_map(|o| {
-            let mut instructions = o.script_pubkey.instructions();
+        .filter(|output| output.value == bitcoin::Amount::ZERO)
+        .filter_map(|output| {
+            let mut instructions = output.script_pubkey.instructions();
             if !matches!(instructions.next(), Some(Ok(Instruction::Op(OP_RETURN)))) {
                 return None;
             }
@@ -109,8 +92,7 @@ pub fn payloads_from_tx(tx: &Transaction) -> Vec<Vec<u8>> {
                 return None;
             };
             let data = bytes.as_bytes();
-            // Skip ARK extension outputs (asset packets).
-            if data.len() >= 3 && &data[..3] == b"ARK" {
+            if data.starts_with(b"ARK") {
                 return None;
             }
             Some(data.to_vec())
@@ -118,163 +100,514 @@ pub fn payloads_from_tx(tx: &Transaction) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// A game event: a decoded message plus the tx that carried it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Event {
-    pub txid: Txid,
-    /// Which player's script created a VTXO in this tx (0 = us, 1 = opponent).
-    pub side: u8,
-    pub msg: Msg,
-    /// True when the tx also carries an ARK extension output (asset packet).
-    pub has_asset_packet: bool,
+pub fn receipt_from_tx(tx: &Transaction) -> Option<MoveReceipt> {
+    let receipts: Vec<_> = payloads_from_tx(tx)
+        .iter()
+        .filter_map(|payload| MoveReceipt::decode(payload))
+        .collect();
+    match receipts.as_slice() {
+        [receipt] => Some(*receipt),
+        _ => None,
+    }
 }
 
-/// Order events deterministically: causal chains per player via (seq),
-/// interleaved by tick, ties broken by txid. Both clients compute the
-/// identical order from the same set.
-pub fn order_events(mut events: Vec<Event>) -> Vec<Event> {
-    events.sort_by(|a, b| {
-        (a.side, a.msg.seq)
-            .cmp(&(b.side, b.msg.seq))
-            .then(a.msg.tick_ms.cmp(&b.msg.tick_ms))
-            .then(a.txid.cmp(&b.txid))
-    });
-    // Stable interleave: walk both chains by seq, emitting whichever has the
-    // smaller tick; ties broken by side. Deterministic given the same set.
-    let mut by_side: [std::collections::VecDeque<Event>; 2] =
-        [Default::default(), Default::default()];
-    for e in events {
-        by_side[e.side as usize].push_back(e);
+/// Arkade's GetAsset endpoint returns metadata as hex-encoded uLEB128 fields.
+pub fn decode_asset_metadata(raw: &str) -> Option<Vec<(String, String)>> {
+    let bytes: Vec<u8> = bitcoin::hex::FromHex::from_hex(raw).ok()?;
+    let mut cursor = 0usize;
+    let metadata = read_metadata(&bytes, &mut cursor)?;
+    (cursor == bytes.len()).then_some(metadata)
+}
+
+fn read_metadata(bytes: &[u8], cursor: &mut usize) -> Option<Vec<(String, String)>> {
+    let count = read_uvarint(bytes, cursor)?;
+    if count > 1_000 {
+        return None;
     }
-    let mut out = Vec::new();
-    loop {
-        let a = by_side[0].front();
-        let b = by_side[1].front();
-        match (a, b) {
-            (None, None) => break,
-            (Some(_), None) => out.push(by_side[0].pop_front().unwrap()),
-            (None, Some(_)) => out.push(by_side[1].pop_front().unwrap()),
-            (Some(x), Some(y)) => {
-                let take_a = (x.msg.tick_ms, x.txid) <= (y.msg.tick_ms, y.txid);
-                out.push(if take_a {
-                    by_side[0].pop_front().unwrap()
-                } else {
-                    by_side[1].pop_front().unwrap()
-                });
+    let mut metadata = Vec::with_capacity(count.try_into().ok()?);
+    for _ in 0..count {
+        let key = read_string(bytes, cursor)?;
+        let value = read_string(bytes, cursor)?;
+        metadata.push((key, value));
+    }
+    Some(metadata)
+}
+
+fn read_string(bytes: &[u8], cursor: &mut usize) -> Option<String> {
+    let len: usize = read_uvarint(bytes, cursor)?.try_into().ok()?;
+    let end = cursor.checked_add(len)?;
+    let text = std::str::from_utf8(bytes.get(*cursor..end)?)
+        .ok()?
+        .to_string();
+    *cursor = end;
+    Some(text)
+}
+
+fn read_uvarint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *bytes.get(*cursor)?;
+        *cursor += 1;
+        if shift == 63 && byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn read_u16(bytes: &[u8], cursor: &mut usize) -> Option<u16> {
+    let end = cursor.checked_add(2)?;
+    let value = u16::from_le_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+    *cursor = end;
+    Some(value)
+}
+
+fn read_asset_id(bytes: &[u8], cursor: &mut usize) -> Option<AssetId> {
+    let end = cursor.checked_add(32)?;
+    let mut txid_bytes: [u8; 32] = bytes.get(*cursor..end)?.try_into().ok()?;
+    *cursor = end;
+    txid_bytes.reverse();
+    Some(AssetId {
+        txid: Txid::from_byte_array(txid_bytes),
+        group_index: read_u16(bytes, cursor)?,
+    })
+}
+
+fn read_control_asset(bytes: &[u8], cursor: &mut usize) -> Option<()> {
+    let kind = *bytes.get(*cursor)?;
+    *cursor += 1;
+    match kind {
+        1 => {
+            read_asset_id(bytes, cursor)?;
+        }
+        2 => {
+            read_u16(bytes, cursor)?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn read_assignments(bytes: &[u8], cursor: &mut usize) -> Option<Vec<AssetAssignment>> {
+    let count = read_uvarint(bytes, cursor)?;
+    if count > 10_000 {
+        return None;
+    }
+    let mut assignments = Vec::with_capacity(count.try_into().ok()?);
+    for _ in 0..count {
+        if *bytes.get(*cursor)? != 1 {
+            return None;
+        }
+        *cursor += 1;
+        assignments.push(AssetAssignment {
+            index: read_u16(bytes, cursor)?,
+            amount: read_uvarint(bytes, cursor)?,
+        });
+    }
+    Some(assignments)
+}
+
+fn decode_asset_packet(bytes: &[u8]) -> Option<AssetPacket> {
+    let mut cursor = 0usize;
+    let count = read_uvarint(bytes, &mut cursor)?;
+    if count == 0 || count > 1_000 {
+        return None;
+    }
+    let mut groups = Vec::with_capacity(count.try_into().ok()?);
+    for _ in 0..count {
+        let presence = *bytes.get(cursor)?;
+        cursor += 1;
+        if presence & !0x07 != 0 {
+            return None;
+        }
+        let asset_id = if presence & 0x01 != 0 {
+            Some(read_asset_id(bytes, &mut cursor)?)
+        } else {
+            None
+        };
+        let has_control_asset = presence & 0x02 != 0;
+        if has_control_asset {
+            read_control_asset(bytes, &mut cursor)?;
+        }
+        let metadata = if presence & 0x04 != 0 {
+            Some(read_metadata(bytes, &mut cursor)?)
+        } else {
+            None
+        };
+        groups.push(AssetPacketGroup {
+            asset_id,
+            has_control_asset,
+            metadata,
+            inputs: read_assignments(bytes, &mut cursor)?,
+            outputs: read_assignments(bytes, &mut cursor)?,
+        });
+    }
+    (cursor == bytes.len()).then_some(AssetPacket { groups })
+}
+
+pub fn asset_packet_from_tx(tx: &Transaction) -> Option<AssetPacket> {
+    let mut packet = None;
+    for output in &tx.output {
+        let Some(payload) = ark_core::extension::extension_payload(&output.script_pubkey) else {
+            continue;
+        };
+        for (packet_type, bytes) in ark_core::extension::iter_packets(payload).ok()? {
+            if packet_type != 0 {
+                continue;
+            }
+            if packet.is_some() {
+                return None;
+            }
+            packet = Some(decode_asset_packet(bytes)?);
+        }
+    }
+    packet
+}
+
+fn direction_from_pairs(metadata: &[(String, String)], group_index: u16) -> Option<u8> {
+    let direction = u8::try_from(group_index).ok()?;
+    let expected = crate::game::DIRECTIONS.get(direction as usize)?.to_string();
+    (metadata
+        == [
+            ("game".to_string(), GAME_ID.to_string()),
+            ("move".to_string(), expected),
+        ])
+    .then_some(direction)
+}
+
+fn is_valid_move_issuance(tx: &Transaction) -> bool {
+    let Some(packet) = asset_packet_from_tx(tx) else {
+        return false;
+    };
+    if packet.groups.len() != crate::game::DIRECTIONS.len() {
+        return false;
+    }
+    packet.groups.iter().enumerate().all(|(index, group)| {
+        group.asset_id.is_none()
+            && !group.has_control_asset
+            && group.inputs.is_empty()
+            && group.outputs
+                == [AssetAssignment {
+                    index: PLAYER_ASSET_OUTPUT_INDEX,
+                    amount: MOVE_SUPPLY,
+                }]
+            && group
+                .metadata
+                .as_deref()
+                .and_then(|metadata| direction_from_pairs(metadata, index as u16))
+                == Some(index as u8)
+    })
+}
+
+/// Validate a canonical issuance that permanently registers itself at the
+/// game script, and return the script carrying the new player's assets.
+pub fn registration_player_script(
+    tx: &Transaction,
+    game_script_hex: &str,
+    dust_sats: u64,
+) -> Option<String> {
+    if !payloads_from_tx(tx).is_empty() || !is_valid_move_issuance(tx) {
+        return None;
+    }
+    let game_outputs: Vec<_> = tx
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, output)| output.script_pubkey.to_hex_string() == game_script_hex)
+        .collect();
+    if game_outputs.len() != 1
+        || game_outputs[0].0 != 0
+        || game_outputs[0].1.value.to_sat() != dust_sats
+    {
+        return None;
+    }
+    let player_output = tx.output.get(usize::from(PLAYER_ASSET_OUTPUT_INDEX))?;
+    if player_output.value.to_sat() != dust_sats
+        || !player_output.script_pubkey.is_p2tr()
+        || player_output.script_pubkey.to_hex_string() == game_script_hex
+    {
+        return None;
+    }
+    Some(player_output.script_pubkey.to_hex_string())
+}
+
+/// Parse a native one-unit move-asset burn. Destination-script checks happen
+/// after lookup of the registered player script.
+pub fn move_burn_from_tx(tx: &Transaction) -> Option<MoveBurn> {
+    let receipt = receipt_from_tx(tx)?;
+    let packet = asset_packet_from_tx(tx)?;
+    let mut player = None;
+    let mut burned = None;
+    let mut asset_ids = HashSet::new();
+    let mut preserved_output_indexes = Vec::new();
+
+    for group in packet.groups {
+        let asset_id = group.asset_id?;
+        if group.has_control_asset
+            || group.metadata.is_some()
+            || group.inputs.is_empty()
+            || asset_id.group_index >= crate::game::DIRECTIONS.len() as u16
+            || !asset_ids.insert(asset_id)
+        {
+            return None;
+        }
+        match player {
+            Some(txid) if txid != asset_id.txid => return None,
+            None => player = Some(asset_id.txid),
+            _ => {}
+        }
+        if group.inputs.iter().any(|input| input.amount == 0)
+            || group.outputs.iter().any(|output| output.amount == 0)
+        {
+            return None;
+        }
+        let input_amount = group
+            .inputs
+            .iter()
+            .try_fold(0u64, |sum, input| sum.checked_add(input.amount))?;
+        let output_amount = group
+            .outputs
+            .iter()
+            .try_fold(0u64, |sum, output| sum.checked_add(output.amount))?;
+        let deficit = input_amount.checked_sub(output_amount)?;
+        match deficit {
+            0 => {}
+            1 if burned.is_none() => burned = Some(asset_id),
+            _ => return None,
+        }
+        for output in group.outputs {
+            tx.output.get(usize::from(output.index))?;
+            if !preserved_output_indexes.contains(&output.index) {
+                preserved_output_indexes.push(output.index);
             }
         }
     }
-    out
+
+    Some(MoveBurn {
+        receipt,
+        asset_id: burned?,
+        preserved_output_indexes,
+    })
 }
 
-/// Tracks which virtual txs we've already consumed for a match.
-pub struct LogCursor {
-    /// VTXO outpoints (as "txid:vout") already processed.
-    pub seen_outpoints: std::collections::HashSet<String>,
-    /// Virtual txids already fetched and parsed.
-    pub seen_txs: HashMap<Txid, ()>,
+/// Validate the metadata and canonical group index of a move asset.
+pub fn direction_from_metadata(raw: &str, group_index: u16) -> Option<u8> {
+    let metadata = decode_asset_metadata(raw)?;
+    direction_from_pairs(&metadata, group_index)
 }
 
-impl Default for LogCursor {
-    fn default() -> Self {
-        Self::new()
+/// Return contiguous, deduplicated move streams keyed by issuance txid.
+pub fn canonical_moves(events: &[MoveEvent]) -> BTreeMap<Txid, Vec<u8>> {
+    let mut grouped: BTreeMap<Txid, Vec<&MoveEvent>> = BTreeMap::new();
+    for event in events {
+        grouped.entry(event.player).or_default().push(event);
     }
-}
 
-impl LogCursor {
-    pub fn new() -> Self {
-        Self {
-            seen_outpoints: Default::default(),
-            seen_txs: Default::default(),
+    let mut out = BTreeMap::new();
+    for (player, mut moves) in grouped {
+        moves.sort_by_key(|event| (event.sequence, event.txid));
+        let mut expected = 0u32;
+        let mut directions = Vec::new();
+        for event in moves {
+            if event.sequence < expected {
+                continue;
+            }
+            if event.sequence > expected {
+                break;
+            }
+            directions.push(event.direction);
+            expected = expected.saturating_add(1);
         }
+        out.insert(player, directions);
     }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ark_core::asset::packet::{AssetGroup, AssetInput, AssetOutput, Packet};
+    use bitcoin::hashes::Hash;
+    use bitcoin::hex::DisplayHex;
+    use bitcoin::{absolute, transaction, Amount, ScriptBuf, Transaction, TxOut};
 
-    #[test]
-    fn no_kind_encodes_to_subdust_length() {
-        // 32-byte payloads collide with the operator's sub-dust VTXO script
-        // shape (OP_RETURN + 32-byte key). Every kind must avoid it.
-        for kind in [Kind::Start, Kind::Ack, Kind::Move, Kind::Fire, Kind::End] {
-            let data = match kind {
-                Kind::Start => b"tark1qexample".to_vec(),
-                Kind::Ack => 0u64.to_le_bytes().to_vec(),
-                Kind::Move => vec![0u8],
-                Kind::Fire => vec![0u8],
-                Kind::End => 0u64.to_le_bytes().to_vec(),
-            };
-            let msg = Msg {
-                match_tag: [0; 8],
-                seq: 0,
-                prev: [0; 8],
-                tick_ms: 0,
-                kind,
-                data,
-            };
-            assert_ne!(msg.encode().len(), 32, "{kind:?} encodes to 32 bytes");
+    fn txid(byte: u8) -> Txid {
+        Txid::from_byte_array([byte; 32])
+    }
+
+    fn encode_metadata(pairs: &[(&str, &str)]) -> String {
+        let mut bytes = vec![pairs.len() as u8];
+        for (key, value) in pairs {
+            bytes.push(key.len() as u8);
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.push(value.len() as u8);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        bytes.to_lower_hex_string()
+    }
+
+    fn packet_tx(packet: Packet) -> Transaction {
+        Transaction {
+            version: transaction::Version::non_standard(3),
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(330),
+                    script_pubkey: ScriptBuf::new(),
+                },
+                packet.to_txout(),
+            ],
+        }
+    }
+
+    fn p2tr_script(byte: u8) -> ScriptBuf {
+        let mut bytes = vec![0x51, 0x20];
+        bytes.extend_from_slice(&[byte; 32]);
+        ScriptBuf::from_bytes(bytes)
+    }
+
+    fn receipt_output(sequence: u32) -> TxOut {
+        let payload = MoveReceipt { sequence }.encode();
+        let data = bitcoin::script::PushBytesBuf::try_from(payload.to_vec()).unwrap();
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: bitcoin::script::Builder::new()
+                .push_opcode(OP_RETURN)
+                .push_slice(&data)
+                .into_script(),
         }
     }
 
     #[test]
-    fn msg_roundtrip() {
-        let msg = Msg {
-            match_tag: [1, 2, 3, 4, 5, 6, 7, 8],
-            seq: 42,
-            prev: [0xaa; 8],
-            tick_ms: 1_700_000_000_123,
-            kind: Kind::Move,
-            data: vec![0b0101],
-        };
-        let decoded = Msg::decode(&msg.encode()).unwrap();
-        assert_eq!(decoded.seq, 42);
-        assert_eq!(decoded.tick_ms, msg.tick_ms);
-        assert_eq!(decoded.kind, Kind::Move);
-        assert_eq!(decoded.data, vec![0b0101]);
+    fn receipt_roundtrip_and_rejection() {
+        let receipt = MoveReceipt { sequence: 42 };
+        assert_eq!(MoveReceipt::decode(&receipt.encode()), Some(receipt));
+        assert_eq!(MoveReceipt::decode(b"AM\x01\0\0\0\0"), None);
+        assert_eq!(MoveReceipt::decode(b"short"), None);
+
+        let mut tx = packet_tx(Packet { groups: Vec::new() });
+        assert_eq!(receipt_from_tx(&tx), None);
+        tx.output.push(receipt_output(1));
+        assert_eq!(receipt_from_tx(&tx), Some(MoveReceipt { sequence: 1 }));
+        tx.output.push(receipt_output(2));
+        assert_eq!(receipt_from_tx(&tx), None);
     }
 
     #[test]
-    fn rejects_garbage() {
-        assert!(Msg::decode(b"").is_none());
-        assert!(Msg::decode(b"GM\x00").is_none());
-        assert!(Msg::decode(b"XX\x01........").is_none());
+    fn metadata_identifies_direction() {
+        let raw = encode_metadata(&[("game", GAME_ID), ("move", "s")]);
+        assert_eq!(
+            direction_from_metadata(&raw, 2),
+            Some(crate::game::DIR_DOWN)
+        );
+        assert_eq!(direction_from_metadata(&raw, 1), None);
+        assert_eq!(direction_from_metadata("not hex", 2), None);
     }
 
     #[test]
-    fn deterministic_interleave() {
-        let mk = |side: u8, seq: u32, tick: u64, txid_byte: u8| Event {
-            txid: {
-                use bitcoin::hashes::Hash;
-                Txid::from_byte_array([txid_byte; 32])
+    fn canonical_stream_requires_contiguous_sequences() {
+        let player = txid(9);
+        let events = vec![
+            MoveEvent {
+                txid: txid(4),
+                player,
+                sequence: 1,
+                direction: 1,
             },
-            side,
-            msg: Msg {
-                match_tag: [0; 8],
-                seq,
-                prev: [0; 8],
-                tick_ms: tick,
-                kind: Kind::Move,
-                data: vec![],
+            MoveEvent {
+                txid: txid(3),
+                player,
+                sequence: 0,
+                direction: 0,
             },
-            has_asset_packet: false,
-        };
-        let a = vec![
-            mk(0, 0, 100, 1),
-            mk(1, 0, 150, 2),
-            mk(0, 1, 200, 3),
-            mk(1, 1, 120, 4),
+            MoveEvent {
+                txid: txid(2),
+                player,
+                sequence: 1,
+                direction: 2,
+            },
+            MoveEvent {
+                txid: txid(5),
+                player,
+                sequence: 3,
+                direction: 3,
+            },
         ];
-        let ordered = order_events(a.clone());
-        let ticks: Vec<_> = ordered.iter().map(|e| (e.side, e.msg.seq)).collect();
-        // Both orderings computed from any permutation must agree.
-        let mut shuffled = a;
-        shuffled.reverse();
-        assert_eq!(order_events(shuffled), ordered);
-        // seq order within each side is preserved.
-        let a_seqs: Vec<u32> = ordered.iter().filter(|e| e.side == 0).map(|e| e.msg.seq).collect();
-        assert_eq!(a_seqs, vec![0, 1]);
-        let _ = ticks;
+        assert_eq!(canonical_moves(&events)[&player], vec![0, 2]);
+    }
+
+    #[test]
+    fn validates_canonical_registration_and_issuance() {
+        let groups = crate::game::DIRECTIONS
+            .iter()
+            .map(|direction| AssetGroup {
+                asset_id: None,
+                control_asset: None,
+                metadata: Some(vec![
+                    ("game".to_string(), GAME_ID.to_string()),
+                    ("move".to_string(), direction.to_string()),
+                ]),
+                inputs: Vec::new(),
+                outputs: vec![AssetOutput {
+                    output_index: PLAYER_ASSET_OUTPUT_INDEX,
+                    amount: MOVE_SUPPLY,
+                }],
+            })
+            .collect();
+        let game_script = p2tr_script(1);
+        let player_script = p2tr_script(2);
+        let mut tx = packet_tx(Packet { groups });
+        tx.output.insert(
+            0,
+            TxOut {
+                value: Amount::from_sat(330),
+                script_pubkey: game_script.clone(),
+            },
+        );
+        tx.output[1] = TxOut {
+            value: Amount::from_sat(330),
+            script_pubkey: player_script.clone(),
+        };
+        assert_eq!(
+            registration_player_script(&tx, &game_script.to_hex_string(), 330),
+            Some(player_script.to_hex_string())
+        );
+    }
+
+    #[test]
+    fn validates_one_unit_protocol_burn() {
+        let asset_id = AssetId {
+            txid: txid(8),
+            group_index: 0,
+        };
+        let mut tx = packet_tx(Packet {
+            groups: vec![AssetGroup {
+                asset_id: Some(asset_id),
+                control_asset: None,
+                metadata: None,
+                inputs: vec![AssetInput {
+                    input_index: 0,
+                    amount: MOVE_SUPPLY,
+                }],
+                outputs: vec![AssetOutput {
+                    output_index: 0,
+                    amount: MOVE_SUPPLY - 1,
+                }],
+            }],
+        });
+        tx.output.push(receipt_output(7));
+        assert_eq!(
+            move_burn_from_tx(&tx),
+            Some(MoveBurn {
+                receipt: MoveReceipt { sequence: 7 },
+                asset_id,
+                preserved_output_indexes: vec![0],
+            })
+        );
     }
 }

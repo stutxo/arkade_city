@@ -9,26 +9,65 @@ use crate::keys::Keys;
 use anyhow::{anyhow, Result};
 use ark_core::asset::AssetId;
 use ark_core::send::{
-    build_asset_burn_transactions, build_offchain_transactions,
-    build_self_asset_issuance_transactions, sign_ark_transaction, sign_checkpoint_transaction,
+    build_asset_burn_transactions, build_asset_send_transactions, build_offchain_transactions,
+    sign_ark_transaction, sign_checkpoint_transaction,
 };
 use ark_core::server;
 use ark_core::Asset;
 use ark_core::Vtxo;
+use bitcoin::hashes::Hash;
 use bitcoin::opcodes::all::OP_RETURN;
 use bitcoin::psbt;
 use bitcoin::secp256k1::{schnorr, Message};
-use bitcoin::{Amount, Psbt, TxOut, Txid, XOnlyPublicKey};
+use bitcoin::sighash::{Prevouts, SighashCache};
+use bitcoin::{Amount, Psbt, TapLeafHash, TapSighashType, TxOut, Txid, XOnlyPublicKey};
 use std::str::FromStr;
+
+pub const MOVE_SUPPLY: u64 = crate::gamelog::MOVE_SUPPLY;
+
+#[derive(Debug, Clone)]
+pub struct PendingFinalize {
+    pub txid: Txid,
+    pub signed_ark: Psbt,
+    pub checkpoints: Vec<Psbt>,
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UnknownSubmission {
+    pub txid: Txid,
+    pub signed_ark: Psbt,
+    pub checkpoints: Vec<Psbt>,
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum RunTxStatus {
+    Finalized(Txid),
+    Pending(PendingFinalize),
+    SubmissionUnknown(UnknownSubmission),
+}
+
+impl RunTxStatus {
+    pub fn txid(&self) -> Txid {
+        match self {
+            Self::Finalized(txid) => *txid,
+            Self::Pending(pending) => pending.txid,
+            Self::SubmissionUnknown(submission) => submission.txid,
+        }
+    }
+}
 
 /// Everything the builders need from `server::Info`, reconstructed from the
 /// REST `/v1/info` payload. Fields the builders never read are placeholders.
 pub fn server_info(params: &ServerParams) -> server::Info {
-    let signer_pk = params.signer_pk.public_key(bitcoin::secp256k1::Parity::Even);
+    let signer_pk = params
+        .signer_pk
+        .public_key(bitcoin::secp256k1::Parity::Even);
     server::Info {
         version: String::new(),
         signer_pk,
-        forfeit_pk: signer_pk,
+        forfeit_pk: params.forfeit_pk.inner,
         forfeit_address: params.forfeit_address.clone(),
         checkpoint_tapscript: params.checkpoint_tapscript.clone(),
         network: params.network,
@@ -48,6 +87,100 @@ pub fn server_info(params: &ServerParams) -> server::Info {
         max_tx_weight: 40_000,
         max_op_return_outputs: params.max_op_return_outputs,
     }
+}
+
+/// Register a player and issue all four direction assets in one transaction.
+/// Output zero is the permanent game-registry entry; output one is an exact
+/// dust carrier that can be recreated by every later protocol burn.
+pub fn build_move_asset_issuance_tx(
+    keys: &Keys,
+    params: &ServerParams,
+    info: &server::Info,
+    game_address: ark_core::ArkAddress,
+    records: &[VtxoRecord],
+) -> Result<(Psbt, Vec<Psbt>, [AssetId; 4])> {
+    if records.is_empty() {
+        return Err(anyhow!("cannot issue move assets without a VTXO"));
+    }
+    if records.iter().any(|record| !record.assets.is_empty()) {
+        return Err(anyhow!("move asset issuance requires BTC-only inputs"));
+    }
+
+    let vtxo = player_vtxo(keys, params)?;
+    let own_address = vtxo.to_ark_address();
+    let inputs: Vec<_> = records
+        .iter()
+        .map(|record| vtxo_input(record, &vtxo))
+        .collect::<Result<_>>()?;
+    let total: Amount = inputs.iter().map(|input| input.amount()).sum();
+    let required = Amount::from_sat(params.dust_sats.saturating_mul(2));
+    if total < required {
+        return Err(anyhow!(
+            "player registration requires at least {} sats",
+            required.to_sat()
+        ));
+    }
+    let receivers = [
+        ark_core::send::SendReceiver::bitcoin(game_address, Amount::from_sat(params.dust_sats)),
+        ark_core::send::SendReceiver::bitcoin(own_address, Amount::from_sat(params.dust_sats)),
+    ];
+    let mut txs = build_offchain_transactions(&receivers, &own_address, &inputs, info)
+        .map_err(|e| anyhow!("build player registration: {e}"))?;
+
+    let groups = crate::game::DIRECTIONS
+        .iter()
+        .map(|direction| ark_core::asset::packet::AssetGroup {
+            asset_id: None,
+            control_asset: None,
+            metadata: Some(vec![
+                ("game".to_string(), crate::gamelog::GAME_ID.to_string()),
+                ("move".to_string(), direction.to_string()),
+            ]),
+            inputs: Vec::new(),
+            outputs: vec![ark_core::asset::packet::AssetOutput {
+                output_index: crate::gamelog::PLAYER_ASSET_OUTPUT_INDEX,
+                amount: MOVE_SUPPLY,
+            }],
+        })
+        .collect();
+    ark_core::asset::packet::add_asset_packet_to_psbt(
+        &mut txs.ark_tx,
+        &ark_core::asset::packet::Packet { groups },
+    )
+    .map_err(|e| anyhow!("attach move asset packet: {e}"))?;
+
+    let txid = txs.ark_tx.unsigned_tx.compute_txid();
+    let asset_ids = std::array::from_fn(|group_index| AssetId {
+        txid,
+        group_index: group_index as u16,
+    });
+    Ok((txs.ark_tx, txs.checkpoint_txs, asset_ids))
+}
+
+/// Burn one direction asset while recreating the player's dust carrier.
+pub fn build_move_burn_tx(
+    keys: &Keys,
+    params: &ServerParams,
+    info: &server::Info,
+    input: &VtxoRecord,
+    asset_id: AssetId,
+    sequence: u32,
+) -> Result<(Psbt, Vec<Psbt>)> {
+    if input.amount_sats != params.dust_sats {
+        return Err(anyhow!(
+            "move asset carrier must contain exactly {} sats",
+            params.dust_sats
+        ));
+    }
+    let vtxo = player_vtxo(keys, params)?;
+    let own_address = vtxo.to_ark_address();
+    let inputs = [vtxo_input(input, &vtxo)?];
+    let mut txs =
+        build_asset_burn_transactions(&own_address, &own_address, &inputs, info, asset_id, 1)
+            .map_err(|e| anyhow!("build move asset burn: {e}"))?;
+    let receipt = crate::gamelog::MoveReceipt { sequence }.encode();
+    attach_op_return(&mut txs.ark_tx, &receipt)?;
+    Ok((txs.ark_tx, txs.checkpoint_txs))
 }
 
 /// The player's default VTXO contract (2-of-2 forfeit + CSV exit leaves).
@@ -106,7 +239,10 @@ fn parse_asset_id_inner(s: &str) -> Option<ark_core::asset::AssetId> {
     }
     let txid = Txid::from_str(&s[..64]).ok()?;
     let bytes: [u8; 2] = bitcoin::hex::FromHex::from_hex(&s[64..]).ok()?;
-    Some(ark_core::asset::AssetId { txid, group_index: u16::from_le_bytes(bytes) })
+    Some(ark_core::asset::AssetId {
+        txid,
+        group_index: u16::from_le_bytes(bytes),
+    })
 }
 
 /// Build a plain (non-extension) OP_RETURN output: `OP_RETURN <payload>`.
@@ -136,7 +272,11 @@ pub fn attach_op_return(ark_tx: &mut Psbt, payload: &[u8]) -> Result<()> {
 
 fn make_sign_fn<'a>(
     keys: &'a Keys,
-) -> impl FnMut(&mut psbt::Input, Message) -> Result<Vec<(schnorr::Signature, XOnlyPublicKey)>, ark_core::Error> + 'a {
+) -> impl FnMut(
+    &mut psbt::Input,
+    Message,
+) -> Result<Vec<(schnorr::Signature, XOnlyPublicKey)>, ark_core::Error>
+       + 'a {
     |_input, msg| Ok(keys.sign_msg(&msg))
 }
 
@@ -145,53 +285,348 @@ fn make_sign_fn<'a>(
 pub async fn run_tx(
     keys: &Keys,
     rest: &ArkadeRest,
+    ark_tx: Psbt,
+    checkpoint_txs: Vec<Psbt>,
+) -> Result<RunTxStatus> {
+    let prepared = prepare_tx(keys, ark_tx, checkpoint_txs)?;
+    submit_prepared(keys, rest, prepared.signed_ark, prepared.checkpoints).await
+}
+
+/// Sign a transaction completely on the client without contacting the
+/// operator. Persist the returned value before calling submission recovery so
+/// a reload can always retry the exact same transaction.
+pub fn prepare_tx(
+    keys: &Keys,
     mut ark_tx: Psbt,
     checkpoint_txs: Vec<Psbt>,
-) -> Result<Txid> {
+) -> Result<UnknownSubmission> {
     for i in 0..checkpoint_txs.len() {
         sign_ark_transaction(make_sign_fn(keys), &mut ark_tx, i)
             .map_err(|e| anyhow!("sign ark input {i}: {e}"))?;
     }
+    Ok(UnknownSubmission {
+        txid: ark_tx.unsigned_tx.compute_txid(),
+        signed_ark: ark_tx,
+        checkpoints: checkpoint_txs,
+        last_error: "prepared locally; awaiting durable submission".to_string(),
+    })
+}
 
-    let (txid, signed_ark, signed_checkpoints) = rest.submit_tx(&ark_tx, &checkpoint_txs).await?;
+async fn submit_prepared(
+    keys: &Keys,
+    rest: &ArkadeRest,
+    ark_tx: Psbt,
+    checkpoint_txs: Vec<Psbt>,
+) -> Result<RunTxStatus> {
+    let expected_txid = ark_tx.unsigned_tx.compute_txid();
+    let (txid, returned_ark, returned_checkpoints) =
+        match rest.submit_tx(&ark_tx, &checkpoint_txs).await {
+            Ok(response) => response,
+            Err(error) => {
+                let text = format!("{error:#}");
+                if text.contains("failed (4") {
+                    return Err(error);
+                }
+                return Ok(RunTxStatus::SubmissionUnknown(UnknownSubmission {
+                    txid: expected_txid,
+                    signed_ark: ark_tx,
+                    checkpoints: checkpoint_txs,
+                    last_error: text,
+                }));
+            }
+        };
+    let (signed_ark, signed_checkpoints) = verify_submit_response(
+        keys,
+        &ark_tx,
+        &checkpoint_txs,
+        txid,
+        returned_ark,
+        returned_checkpoints,
+    )?;
+    finalize_verified_response(keys, rest, txid, signed_ark, signed_checkpoints).await
+}
 
-    // Restore witness scripts the server may have stripped, then sign each
-    // checkpoint (mirrors the SDK client's finalize path).
-    let ark_input_idx_by_cp_txid: std::collections::HashMap<Txid, usize> = signed_ark
-        .unsigned_tx
-        .input
-        .iter()
-        .enumerate()
-        .map(|(i, inp)| (inp.previous_output.txid, i))
-        .collect();
+async fn finalize_verified_response(
+    keys: &Keys,
+    rest: &ArkadeRest,
+    txid: Txid,
+    signed_ark: Psbt,
+    signed_checkpoints: Vec<Psbt>,
+) -> Result<RunTxStatus> {
+    let pending = PendingFinalize {
+        txid,
+        signed_ark,
+        checkpoints: signed_checkpoints,
+        last_error: String::new(),
+    };
+    match finalize_pending(keys, rest, &pending).await {
+        Ok(()) => Ok(RunTxStatus::Finalized(txid)),
+        Err(error) => Ok(RunTxStatus::Pending(PendingFinalize {
+            last_error: format!("{error:#}"),
+            ..pending
+        })),
+    }
+}
 
-    let mut final_checkpoints = Vec::with_capacity(signed_checkpoints.len());
-    for mut cp in signed_checkpoints {
-        if cp.inputs[0].witness_script.is_none() {
-            let cp_txid = cp.unsigned_tx.compute_txid();
-            let idx = ark_input_idx_by_cp_txid
-                .get(&cp_txid)
-                .ok_or_else(|| anyhow!("checkpoint txid not among ark inputs"))?;
-            cp.inputs[0].witness_script = signed_ark.inputs[*idx].witness_script.clone();
-        }
-        sign_checkpoint_transaction(make_sign_fn(keys), &mut cp)
-            .map_err(|e| anyhow!("sign checkpoint: {e}"))?;
-        final_checkpoints.push(cp);
+/// Recover a request whose submit response was lost. If the operator did not
+/// accept it, resubmit the exact same signed transaction instead of rebuilding
+/// it with a new sequence or asset burn.
+pub async fn retry_unknown_submission(
+    keys: &Keys,
+    params: &ServerParams,
+    rest: &ArkadeRest,
+    unknown: &UnknownSubmission,
+) -> Result<RunTxStatus> {
+    let intent = pending_transaction_intent(keys, params, &unknown.checkpoints)?;
+    let pending_txs = rest.get_pending_txs(intent).await?;
+    if let Some((txid, returned_ark, returned_checkpoints)) = pending_txs
+        .into_iter()
+        .find(|(txid, _, _)| *txid == unknown.txid)
+    {
+        let (signed_ark, signed_checkpoints) = verify_submit_response(
+            keys,
+            &unknown.signed_ark,
+            &unknown.checkpoints,
+            txid,
+            returned_ark,
+            returned_checkpoints,
+        )?;
+        return finalize_verified_response(keys, rest, txid, signed_ark, signed_checkpoints).await;
     }
 
-    // Finalize with a few retries: the tx stays pending server-side until
-    // this lands, and a transient failure here must not strand the spend.
+    submit_prepared(
+        keys,
+        rest,
+        unknown.signed_ark.clone(),
+        unknown.checkpoints.clone(),
+    )
+    .await
+}
+
+fn pending_transaction_intent(
+    keys: &Keys,
+    params: &ServerParams,
+    checkpoints: &[Psbt],
+) -> Result<ark_core::intent::Intent> {
+    if checkpoints.is_empty() || checkpoints.len() > 20 {
+        return Err(anyhow!(
+            "pending recovery requires between 1 and 20 checkpoint inputs"
+        ));
+    }
+    let vtxo = player_vtxo(keys, params)?;
+    let mut inputs = Vec::with_capacity(checkpoints.len());
+    for checkpoint in checkpoints {
+        if checkpoint.unsigned_tx.input.len() != 1 || checkpoint.inputs.len() != 1 {
+            return Err(anyhow!("pending checkpoint has an invalid input count"));
+        }
+        let psbt_input = &checkpoint.inputs[0];
+        let (control_block, (spend_script, _)) = psbt_input
+            .tap_scripts
+            .first_key_value()
+            .ok_or_else(|| anyhow!("pending checkpoint has no spend path"))?;
+        let witness_utxo = psbt_input
+            .witness_utxo
+            .clone()
+            .ok_or_else(|| anyhow!("pending checkpoint has no witness UTXO"))?;
+        inputs.push(ark_core::intent::Input::new(
+            checkpoint.unsigned_tx.input[0].previous_output,
+            checkpoint.unsigned_tx.input[0].sequence,
+            None,
+            witness_utxo,
+            vtxo.tapscripts().to_vec(),
+            (spend_script.clone(), control_block.clone()),
+            false,
+            false,
+            Vec::new(),
+        ));
+    }
+
+    ark_core::intent::make_intent(
+        |_input, message| Ok(keys.sign_msg(&message)),
+        |_input, _message| Err(ark_core::Error::ad_hoc("unexpected onchain input")),
+        inputs,
+        Vec::new(),
+        ark_core::intent::IntentMessage::GetPendingTx { expire_at: 0 },
+    )
+    .map_err(|error| anyhow!("build pending transaction ownership proof: {error}"))
+}
+
+fn verify_submit_response(
+    keys: &Keys,
+    expected_ark: &Psbt,
+    expected_checkpoints: &[Psbt],
+    response_txid: Txid,
+    returned_ark: Psbt,
+    returned_checkpoints: Vec<Psbt>,
+) -> Result<(Psbt, Vec<Psbt>)> {
+    let expected_txid = expected_ark.unsigned_tx.compute_txid();
+    if response_txid != expected_txid
+        || returned_ark.unsigned_tx.compute_txid() != expected_txid
+        || returned_ark.unsigned_tx != expected_ark.unsigned_tx
+    {
+        return Err(anyhow!("operator changed the submitted Ark transaction"));
+    }
+    if returned_ark.inputs.len() != expected_ark.inputs.len() {
+        return Err(anyhow!("operator returned an invalid Ark PSBT"));
+    }
+
+    let mut verified_ark = expected_ark.clone();
+    for input_index in 0..expected_ark.inputs.len() {
+        let (key, signature) =
+            verified_server_signature(keys, expected_ark, &returned_ark, input_index)?;
+        verified_ark.inputs[input_index]
+            .tap_script_sigs
+            .insert(key, signature);
+    }
+
+    if returned_checkpoints.len() != expected_checkpoints.len() {
+        return Err(anyhow!(
+            "operator returned {} checkpoints for {} inputs",
+            returned_checkpoints.len(),
+            expected_checkpoints.len()
+        ));
+    }
+    let mut returned_by_txid = std::collections::HashMap::new();
+    for checkpoint in returned_checkpoints {
+        let txid = checkpoint.unsigned_tx.compute_txid();
+        if returned_by_txid.insert(txid, checkpoint).is_some() {
+            return Err(anyhow!("operator returned duplicate checkpoint {txid}"));
+        }
+    }
+
+    let mut verified_checkpoints = Vec::with_capacity(expected_checkpoints.len());
+    for expected in expected_checkpoints {
+        let checkpoint_txid = expected.unsigned_tx.compute_txid();
+        let returned = returned_by_txid
+            .remove(&checkpoint_txid)
+            .ok_or_else(|| anyhow!("operator omitted checkpoint {checkpoint_txid}"))?;
+        if returned.unsigned_tx != expected.unsigned_tx
+            || returned.inputs.len() != expected.inputs.len()
+        {
+            return Err(anyhow!(
+                "operator changed checkpoint transaction {checkpoint_txid}"
+            ));
+        }
+        let mut verified = expected.clone();
+        for input_index in 0..expected.inputs.len() {
+            let (key, signature) =
+                verified_server_signature(keys, expected, &returned, input_index)?;
+            verified.inputs[input_index]
+                .tap_script_sigs
+                .insert(key, signature);
+        }
+        verified_checkpoints.push(verified);
+    }
+    if !returned_by_txid.is_empty() {
+        return Err(anyhow!("operator returned unexpected checkpoints"));
+    }
+    Ok((verified_ark, verified_checkpoints))
+}
+
+fn verified_server_signature(
+    keys: &Keys,
+    expected: &Psbt,
+    returned: &Psbt,
+    input_index: usize,
+) -> Result<((XOnlyPublicKey, TapLeafHash), bitcoin::taproot::Signature)> {
+    let expected_input = expected
+        .inputs
+        .get(input_index)
+        .ok_or_else(|| anyhow!("missing expected PSBT input {input_index}"))?;
+    let (_, (spend_script, leaf_version)) = expected_input
+        .tap_scripts
+        .first_key_value()
+        .ok_or_else(|| anyhow!("expected PSBT input {input_index} has no spend script"))?;
+    let server_keys: Vec<_> = ark_core::script::extract_checksig_pubkeys(spend_script)
+        .into_iter()
+        .filter(|pk| *pk != keys.owner_pk())
+        .collect();
+    if server_keys.len() != 1 {
+        return Err(anyhow!(
+            "expected PSBT input {input_index} does not have one server signer"
+        ));
+    }
+    let server_key = server_keys[0];
+    let leaf_hash = TapLeafHash::from_script(spend_script, *leaf_version);
+    let signature = returned
+        .inputs
+        .get(input_index)
+        .and_then(|input| input.tap_script_sigs.get(&(server_key, leaf_hash)))
+        .cloned()
+        .ok_or_else(|| anyhow!("operator signature missing from PSBT input {input_index}"))?;
+    if signature.sighash_type != TapSighashType::Default {
+        return Err(anyhow!(
+            "operator used an unexpected sighash on PSBT input {input_index}"
+        ));
+    }
+
+    let prevouts = expected
+        .inputs
+        .iter()
+        .map(|input| {
+            input
+                .witness_utxo
+                .clone()
+                .ok_or_else(|| anyhow!("expected PSBT input is missing its witness UTXO"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let sighash = SighashCache::new(&expected.unsigned_tx)
+        .taproot_script_spend_signature_hash(
+            input_index,
+            &Prevouts::All(&prevouts),
+            leaf_hash,
+            signature.sighash_type,
+        )
+        .map_err(|error| anyhow!("operator signature sighash: {error}"))?;
+    let message = Message::from_digest(sighash.to_raw_hash().to_byte_array());
+    keys.secp
+        .verify_schnorr(&signature.signature, &message, &server_key)
+        .map_err(|error| {
+            anyhow!("invalid operator signature on PSBT input {input_index}: {error}")
+        })?;
+    Ok(((server_key, leaf_hash), signature))
+}
+
+/// Retry finalization without rebuilding or resubmitting the Ark transaction.
+pub async fn finalize_pending(
+    keys: &Keys,
+    rest: &ArkadeRest,
+    pending: &PendingFinalize,
+) -> Result<()> {
+    let checkpoints = sign_pending_checkpoints(keys, pending)?;
+    finalize_checkpoints(rest, pending.txid, &checkpoints).await
+}
+
+fn sign_pending_checkpoints(keys: &Keys, pending: &PendingFinalize) -> Result<Vec<Psbt>> {
+    let mut checkpoints = pending.checkpoints.clone();
+    for checkpoint in &mut checkpoints {
+        let input = checkpoint
+            .inputs
+            .first_mut()
+            .ok_or_else(|| anyhow!("pending checkpoint has no input"))?;
+        if input.witness_script.is_none() {
+            return Err(anyhow!("pending checkpoint missing witness script"));
+        }
+        sign_checkpoint_transaction(make_sign_fn(keys), checkpoint)
+            .map_err(|error| anyhow!("sign checkpoint: {error}"))?;
+    }
+    Ok(checkpoints)
+}
+
+async fn finalize_checkpoints(rest: &ArkadeRest, txid: Txid, checkpoints: &[Psbt]) -> Result<()> {
     let mut last_err = None;
     for attempt in 0..3 {
         if attempt > 0 {
             sleep_ms(500 * attempt as u64).await;
         }
-        match rest.finalize_tx(txid, &final_checkpoints).await {
-            Ok(()) => return Ok(txid),
+        match rest.finalize_tx(txid, checkpoints).await {
+            Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err.expect("attempted").context("finalize failed after retries"))
+    Err(last_err
+        .expect("attempted")
+        .context("finalize failed after retries"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -214,158 +649,189 @@ async fn sleep_ms(ms: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
 }
 
-/// A chained self-send carrying a plain OP_RETURN payload.
-///
-/// Sends `dust` back to ourselves and lets change continue the chain — but
-/// when the change would be a non-zero amount below dust (invalid on the
-/// server: sub-dust band is empty when vtxo_min == dust), the whole input is
-/// folded into the self output instead.
-pub fn build_event_tx(
+/// Sweep all BTC and assets to one recipient without dropping asset packets.
+pub fn build_sweep_tx(
     keys: &Keys,
     params: &ServerParams,
     info: &server::Info,
-    input: &VtxoRecord,
-    payload: &[u8],
+    records: &[VtxoRecord],
+    recipient: ark_core::ArkAddress,
 ) -> Result<(Psbt, Vec<Psbt>)> {
+    if records.is_empty() {
+        return Err(anyhow!("cannot sweep an empty wallet"));
+    }
     let vtxo = player_vtxo(keys, params)?;
     let own_address = vtxo.to_ark_address();
-    let inputs = [vtxo_input(input, &vtxo)?];
-    let send_amount = match input.amount_sats.checked_sub(params.dust_sats) {
-        // change would be 0..dust → fold everything into the self output
-        Some(change) if change > 0 && change < params.dust_sats => input.amount_sats,
-        _ => params.dust_sats,
+    let inputs: Vec<_> = records
+        .iter()
+        .map(|record| vtxo_input(record, &vtxo))
+        .collect::<Result<_>>()?;
+    let amount: Amount = inputs.iter().map(|input| input.amount()).sum();
+    let mut asset_totals: std::collections::HashMap<AssetId, u64> =
+        std::collections::HashMap::new();
+    for input in &inputs {
+        for asset in input.assets() {
+            let total = asset_totals.entry(asset.asset_id).or_default();
+            *total = total.saturating_add(asset.amount);
+        }
+    }
+    let receiver = ark_core::send::SendReceiver {
+        address: recipient,
+        amount,
+        assets: asset_totals
+            .into_iter()
+            .map(|(asset_id, amount)| Asset { asset_id, amount })
+            .collect(),
     };
-    let receivers = [ark_core::send::SendReceiver::bitcoin(
-        own_address,
-        Amount::from_sat(send_amount),
-    )];
-    let mut txs = build_offchain_transactions(&receivers, &own_address, &inputs, info)
-        .map_err(|e| anyhow!("build event tx: {e}"))?;
-    attach_op_return(&mut txs.ark_tx, payload)?;
+    let txs = build_asset_send_transactions(&[receiver], &own_address, &inputs, info)
+        .map_err(|e| anyhow!("build wallet sweep: {e}"))?;
     Ok((txs.ark_tx, txs.checkpoint_txs))
 }
 
-/// Send `amount` sats to `recipient` with an OP_RETURN payload. Used for the
-/// START/ACK handshake messages. If the change would be a non-zero amount
-/// below dust, it is folded into the recipient output (a few extra sats to
-/// the opponent are cheaper than an invalid tx).
-pub fn build_message_tx(
-    keys: &Keys,
-    params: &ServerParams,
-    info: &server::Info,
-    inputs: &[VtxoRecord],
-    recipient: ark_core::ArkAddress,
-    amount_sats: u64,
-    payload: &[u8],
-) -> Result<(Psbt, Vec<Psbt>)> {
-    let vtxo = player_vtxo(keys, params)?;
-    let own_address = vtxo.to_ark_address();
-    let inputs: Vec<_> = inputs
-        .iter()
-        .map(|r| vtxo_input(r, &vtxo))
-        .collect::<Result<_>>()?;
-    let total_in: u64 = inputs.iter().map(|i| i.amount().to_sat()).sum();
-    let mut amount = amount_sats;
-    if let Some(change) = total_in.checked_sub(amount) {
-        if change > 0 && change < params.dust_sats {
-            amount = total_in; // fold the dust change into the message
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::opcodes::all::OP_PUSHNUM_1;
+
+    fn test_params(server_keypair: &bitcoin::key::Keypair) -> ServerParams {
+        let server_pk = server_keypair.public_key();
+        ServerParams {
+            server_version: "test".to_string(),
+            signer_pk: server_keypair.x_only_public_key().0,
+            forfeit_pk: bitcoin::PublicKey::new(server_pk),
+            network: bitcoin::Network::Regtest,
+            network_name: "regtest".to_string(),
+            dust_sats: 330,
+            vtxo_min_sats: 330,
+            unilateral_exit_delay: bitcoin::Sequence::from_height(144),
+            max_op_return_outputs: 2,
+            checkpoint_tapscript: bitcoin::script::Builder::new()
+                .push_opcode(OP_PUSHNUM_1)
+                .into_script(),
+            forfeit_address: "bcrt1q8frde3yn78tl9ecgq4anlz909jh0clefhucdur"
+                .parse::<bitcoin::Address<_>>()
+                .unwrap()
+                .require_network(bitcoin::Network::Regtest)
+                .unwrap(),
         }
     }
-    let receivers = [ark_core::send::SendReceiver::bitcoin(
-        recipient,
-        Amount::from_sat(amount),
-    )];
-    let mut txs = build_offchain_transactions(&receivers, &own_address, &inputs, info)
-        .map_err(|e| anyhow!("build message tx: {e}"))?;
-    attach_op_return(&mut txs.ark_tx, payload)?;
-    Ok((txs.ark_tx, txs.checkpoint_txs))
-}
 
-/// Plain value send with no OP_RETURN (game-key funding).
-pub fn build_send_tx(
-    keys: &Keys,
-    params: &ServerParams,
-    info: &server::Info,
-    inputs: &[VtxoRecord],
-    recipient: ark_core::ArkAddress,
-    amount_sats: u64,
-) -> Result<(Psbt, Vec<Psbt>)> {
-    let vtxo = player_vtxo(keys, params)?;
-    let own_address = vtxo.to_ark_address();
-    let inputs: Vec<_> = inputs
-        .iter()
-        .map(|r| vtxo_input(r, &vtxo))
-        .collect::<Result<_>>()?;
-    let total_in: u64 = inputs.iter().map(|i| i.amount().to_sat()).sum();
-    let mut amount = amount_sats;
-    if let Some(change) = total_in.checked_sub(amount) {
-        if change > 0 && change < params.dust_sats {
-            amount = total_in;
+    fn signed_submit_fixture() -> (Keys, ServerParams, Psbt, Vec<Psbt>, Psbt, Vec<Psbt>) {
+        let secp = bitcoin::key::Secp256k1::new();
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[7; 32]).unwrap();
+        let server_keypair = bitcoin::key::Keypair::from_secret_key(&secp, &secret);
+        let server_pk = server_keypair.x_only_public_key().0;
+        let params = test_params(&server_keypair);
+        let info = server_info(&params);
+        let keys = Keys::generate().unwrap();
+        let player = player_vtxo(&keys, &params).unwrap();
+        let funding = VtxoRecord {
+            outpoint: bitcoin::OutPoint {
+                txid: Txid::from_byte_array([42; 32]),
+                vout: 0,
+            },
+            script: player.script_pubkey().to_hex_string(),
+            amount_sats: 660,
+            assets: Vec::new(),
+            is_spent: false,
+            is_preconfirmed: true,
+            is_swept: false,
+            is_unrolled: false,
+            expires_at: None,
+            ark_txid: None,
+            spent_by: None,
+        };
+        let (mut expected_ark, expected_checkpoints, _) = build_move_asset_issuance_tx(
+            &keys,
+            &params,
+            &info,
+            player.to_ark_address(),
+            &[funding],
+        )
+        .unwrap();
+        for input_index in 0..expected_checkpoints.len() {
+            sign_ark_transaction(make_sign_fn(&keys), &mut expected_ark, input_index).unwrap();
         }
+
+        let mut returned_ark = expected_ark.clone();
+        for input_index in 0..expected_checkpoints.len() {
+            sign_ark_transaction(
+                |_input, message| {
+                    Ok(vec![(
+                        secp.sign_schnorr_no_aux_rand(&message, &server_keypair),
+                        server_pk,
+                    )])
+                },
+                &mut returned_ark,
+                input_index,
+            )
+            .unwrap();
+        }
+        let mut returned_checkpoints = expected_checkpoints.clone();
+        for checkpoint in &mut returned_checkpoints {
+            sign_checkpoint_transaction(
+                |_input, message| {
+                    Ok(vec![(
+                        secp.sign_schnorr_no_aux_rand(&message, &server_keypair),
+                        server_pk,
+                    )])
+                },
+                checkpoint,
+            )
+            .unwrap();
+        }
+        (
+            keys,
+            params,
+            expected_ark,
+            expected_checkpoints,
+            returned_ark,
+            returned_checkpoints,
+        )
     }
-    let receivers = [ark_core::send::SendReceiver::bitcoin(
-        recipient,
-        Amount::from_sat(amount),
-    )];
-    let txs = build_offchain_transactions(&receivers, &own_address, &inputs, info)
-        .map_err(|e| anyhow!("build send tx: {e}"))?;
-    Ok((txs.ark_tx, txs.checkpoint_txs))
-}
 
-/// Self-issue `amount` units of a fresh asset. Returns the derived asset ID.
-pub fn build_issue_tx(
-    keys: &Keys,
-    params: &ServerParams,
-    info: &server::Info,
-    input: &VtxoRecord,
-    amount: u64,
-    metadata: Vec<(String, String)>,
-) -> Result<(Psbt, Vec<Psbt>, AssetId)> {
-    let vtxo = player_vtxo(keys, params)?;
-    let own_address = vtxo.to_ark_address();
-    let inputs = [vtxo_input(input, &vtxo)?];
-    let issued = build_self_asset_issuance_transactions(
-        &own_address,
-        &own_address,
-        &inputs,
-        info,
-        amount,
-        None,
-        Some(metadata),
-    )
-    .map_err(|e| anyhow!("build issuance tx: {e}"))?;
-    let asset_id = *issued
-        .asset_ids
-        .first()
-        .ok_or_else(|| anyhow!("no asset id derived"))?;
-    Ok((issued.ark_tx, issued.checkpoint_txs, asset_id))
-}
+    #[test]
+    fn verifies_and_sanitizes_submit_response() {
+        let (keys, _, expected_ark, expected_checkpoints, returned_ark, returned_checkpoints) =
+            signed_submit_fixture();
+        let txid = expected_ark.unsigned_tx.compute_txid();
+        let verified = verify_submit_response(
+            &keys,
+            &expected_ark,
+            &expected_checkpoints,
+            txid,
+            returned_ark,
+            returned_checkpoints,
+        );
+        assert!(verified.is_ok());
+    }
 
-/// Burn `amount` of `asset_id` (a fired bullet) with an OP_RETURN header.
-pub fn build_burn_tx(
-    keys: &Keys,
-    params: &ServerParams,
-    info: &server::Info,
-    inputs: &[VtxoRecord],
-    asset_id: AssetId,
-    amount: u64,
-    payload: &[u8],
-) -> Result<(Psbt, Vec<Psbt>)> {
-    let vtxo = player_vtxo(keys, params)?;
-    let own_address = vtxo.to_ark_address();
-    let inputs: Vec<_> = inputs
-        .iter()
-        .map(|r| vtxo_input(r, &vtxo))
-        .collect::<Result<_>>()?;
-    let mut txs = build_asset_burn_transactions(
-        &own_address,
-        &own_address,
-        &inputs,
-        info,
-        asset_id,
-        amount,
-    )
-    .map_err(|e| anyhow!("build burn tx: {e}"))?;
-    attach_op_return(&mut txs.ark_tx, payload)?;
-    Ok((txs.ark_tx, txs.checkpoint_txs))
+    #[test]
+    fn rejects_operator_transaction_mutation() {
+        let (keys, _, expected_ark, expected_checkpoints, mut returned_ark, returned_checkpoints) =
+            signed_submit_fixture();
+        returned_ark.unsigned_tx.output[0].value = Amount::from_sat(329);
+        let txid = expected_ark.unsigned_tx.compute_txid();
+        let error = verify_submit_response(
+            &keys,
+            &expected_ark,
+            &expected_checkpoints,
+            txid,
+            returned_ark,
+            returned_checkpoints,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed the submitted Ark"));
+    }
+
+    #[test]
+    fn builds_pending_recovery_ownership_intent() {
+        let (keys, params, _, checkpoints, _, _) = signed_submit_fixture();
+        let intent = pending_transaction_intent(&keys, &params, &checkpoints).unwrap();
+        assert!(intent
+            .serialize_message()
+            .unwrap()
+            .contains("get-pending-tx"));
+        assert!(!intent.serialize_proof().is_empty());
+    }
 }
