@@ -1,4 +1,4 @@
-import init, { App, keyMask } from './pkg/arkade_duel.js?v=0.2.5';
+import init, { App, keyMask } from './pkg/arkade_duel.js?v=0.2.6';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -31,8 +31,9 @@ async function boot() {
   applyNetwork(app.network());
 
   $('net-btn').onclick = () => {
-    // Drop the fragment: invite links are network-specific.
-    location.href = location.pathname + (onMainnet ? '?server=https://mutinynet.arkade.sh' : '');
+    // Keep the fragment: on a same-network invite link this preserves the
+    // lobby; mismatched links get caught by the ark1/tark1 guard anyway.
+    location.href = location.pathname + (onMainnet ? '?server=https://mutinynet.arkade.sh' : '') + location.hash;
   };
 
   setText('address', app.address());
@@ -46,7 +47,9 @@ async function boot() {
 
   $('host-btn').onclick = () => {
     command = 'host';
-    const link = `${location.origin}${location.pathname}#${app.address()}`;
+    // Carry the network in the link so the joiner lands in the right place.
+    const q = onMainnet ? '' : `?server=${serverUrl}`;
+    const link = `${location.origin}${location.pathname}${q}#${app.address()}`;
     setText('host-link', link);
     show('host-link-row');
     $('copy-link').onclick = () => navigator.clipboard.writeText(link);
