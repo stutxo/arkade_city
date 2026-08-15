@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#ffffff">
   <title>Arkade City</title>
-  <link rel="stylesheet" href="game.css?v=2.1.1">
+  <link rel="stylesheet" href="game.css?v=2.2.0">
 </head>
 <body>
   <header>
@@ -45,9 +45,7 @@
         <span>D <b id="asset-d">0</b></span>
       </div>
 
-      <div class="game-head">
-        <span><span id="queue-count">0</span> queued</span>
-      </div>
+      <div id="queue-status" class="queue-status">No moves queued</div>
       <canvas id="canvas" width="520" height="520" aria-label="Shared Arkade city grid"></canvas>
       <div class="controls" aria-label="Movement controls">
         <button data-dir="0">W</button>
@@ -123,6 +121,6 @@
     </details>
   </main>
 
-  <script type="module" src="web.js?v=2.1.1"></script>
+  <script type="module" src="web.js?v=2.2.0"></script>
 </body>
 </html>

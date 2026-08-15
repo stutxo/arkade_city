@@ -134,6 +134,7 @@ pub struct GameApp {
     pending_dirs: VecDeque<u8>,
     pub sending: bool,
     pending_action: Option<PendingAction>,
+    pending_needs_recovery: bool,
 
     events: Vec<MoveEvent>,
     registered_players: BTreeMap<Txid, String>,
@@ -193,6 +194,7 @@ impl GameApp {
             pending_dirs: VecDeque::new(),
             sending: false,
             pending_action: None,
+            pending_needs_recovery: false,
             events: Vec::new(),
             registered_players: BTreeMap::new(),
             invalid_registrations: HashSet::new(),
@@ -285,6 +287,7 @@ impl GameApp {
             self.registered_players.insert(txid, self.player_script());
         }
         self.pending_action = Some(action);
+        self.pending_needs_recovery = true;
         self.log_line(format!(
             "restored pending transaction {} from browser journal",
             short_txid(&txid)
@@ -318,6 +321,10 @@ impl GameApp {
     /// actions, then synchronize game history before executing a move.
     pub async fn step(&mut self, dirs: &[u8], enter_game: bool, sweep_address: Option<&str>) {
         self.queue_inputs(dirs);
+        let action_tick = enter_game
+            || sweep_address.is_some()
+            || self.pending_action.is_some()
+            || !self.pending_dirs.is_empty();
 
         let player_script = self.player_script();
         let spendable = match self.rest.get_vtxos(&player_script, "spendableOnly").await {
@@ -329,15 +336,19 @@ impl GameApp {
         };
         // The indexer extracts the P2TR pubkey and returns regular and sub-dust
         // VTXOs associated with that key.
-        let diagnostics_ready = match self.rest.get_vtxos(&player_script, "").await {
-            Ok(records) => {
-                self.wallet_records = records;
-                self.wallet_sync_ms = now_ms();
-                true
-            }
-            Err(err) => {
-                self.report_error("wallet diagnostics", &err);
-                false
+        let diagnostics_ready = if action_tick {
+            false
+        } else {
+            match self.rest.get_vtxos(&player_script, "").await {
+                Ok(records) => {
+                    self.wallet_records = records;
+                    self.wallet_sync_ms = now_ms();
+                    true
+                }
+                Err(err) => {
+                    self.report_error("wallet diagnostics", &err);
+                    false
+                }
             }
         };
         if self.move_assets.is_none() {
@@ -364,11 +375,15 @@ impl GameApp {
             return;
         }
 
-        let game_ready = match self.refresh_game().await {
-            Ok(()) => true,
-            Err(err) => {
-                self.report_error("game sync", &err);
-                false
+        let game_ready = if !self.pending_dirs.is_empty() && self.local_history_ready() {
+            true
+        } else {
+            match self.refresh_game().await {
+                Ok(()) => true,
+                Err(err) => {
+                    self.report_error("game sync", &err);
+                    false
+                }
             }
         };
         self.reconcile_next_sequence();
@@ -527,6 +542,7 @@ impl GameApp {
             submission,
             asset_ids,
         });
+        self.pending_needs_recovery = false;
         Ok(())
     }
 
@@ -633,6 +649,7 @@ impl GameApp {
             short_txid(&submission.txid)
         ));
         self.pending_action = Some(PendingAction::UnknownSweep { submission });
+        self.pending_needs_recovery = false;
         Ok(())
     }
 
@@ -699,6 +716,7 @@ impl GameApp {
                     direction,
                     sequence: self.next_sequence,
                 });
+                self.pending_needs_recovery = false;
             }
             Err(err) => {
                 self.pending_dirs.push_front(direction);
@@ -708,6 +726,7 @@ impl GameApp {
     }
 
     fn complete_move(&mut self, direction: u8, sequence: u32, txid: Txid) {
+        self.record_move_event(direction, sequence, txid);
         self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
         self.move_balances[direction as usize] =
             self.move_balances[direction as usize].saturating_sub(1);
@@ -719,36 +738,63 @@ impl GameApp {
         ));
     }
 
+    fn record_move_event(&mut self, direction: u8, sequence: u32, txid: Txid) {
+        let Some(player) = self.player_id() else {
+            return;
+        };
+        if self.seen_move_txs.insert(txid) {
+            self.events.push(MoveEvent {
+                txid,
+                player,
+                sequence,
+                direction,
+            });
+        }
+    }
+
     async fn resume_pending(&mut self, spendable: &[VtxoRecord]) {
         let Some(action) = self.pending_action.clone() else {
             return;
         };
-        let observed = match &action {
-            PendingAction::Issuance { asset_ids, .. } => spendable.iter().any(|record| {
-                record
-                    .assets
-                    .iter()
-                    .any(|(id, _)| asset_ids.iter().any(|asset| id == &asset.to_string()))
-            }),
-            PendingAction::Move { pending, .. } => {
-                self.events.iter().any(|event| event.txid == pending.txid)
-                    || self.transaction_is_indexed(pending.txid).await
-            }
-            PendingAction::UnknownIssuance { asset_ids, .. } => spendable.iter().any(|record| {
-                record
-                    .assets
-                    .iter()
-                    .any(|(id, _)| asset_ids.iter().any(|asset| id == &asset.to_string()))
-            }),
-            PendingAction::UnknownMove { submission, .. } => {
-                self.events
-                    .iter()
-                    .any(|event| event.txid == submission.txid)
-                    || self.transaction_is_indexed(submission.txid).await
-            }
-            PendingAction::Sweep { pending } => self.transaction_is_indexed(pending.txid).await,
-            PendingAction::UnknownSweep { submission } => {
-                self.transaction_is_indexed(submission.txid).await
+        let fresh_prepared = !self.pending_needs_recovery
+            && matches!(
+                action,
+                PendingAction::UnknownIssuance { .. }
+                    | PendingAction::UnknownMove { .. }
+                    | PendingAction::UnknownSweep { .. }
+            );
+        let observed = if fresh_prepared {
+            false
+        } else {
+            match &action {
+                PendingAction::Issuance { asset_ids, .. } => spendable.iter().any(|record| {
+                    record
+                        .assets
+                        .iter()
+                        .any(|(id, _)| asset_ids.iter().any(|asset| id == &asset.to_string()))
+                }),
+                PendingAction::Move { pending, .. } => {
+                    self.events.iter().any(|event| event.txid == pending.txid)
+                        || self.transaction_is_indexed(pending.txid).await
+                }
+                PendingAction::UnknownIssuance { asset_ids, .. } => {
+                    spendable.iter().any(|record| {
+                        record
+                            .assets
+                            .iter()
+                            .any(|(id, _)| asset_ids.iter().any(|asset| id == &asset.to_string()))
+                    })
+                }
+                PendingAction::UnknownMove { submission, .. } => {
+                    self.events
+                        .iter()
+                        .any(|event| event.txid == submission.txid)
+                        || self.transaction_is_indexed(submission.txid).await
+                }
+                PendingAction::Sweep { pending } => self.transaction_is_indexed(pending.txid).await,
+                PendingAction::UnknownSweep { submission } => {
+                    self.transaction_is_indexed(submission.txid).await
+                }
             }
         };
         if observed {
@@ -794,9 +840,12 @@ impl GameApp {
             _ => return,
         };
         self.sending = true;
-        let result =
+        let result = if self.pending_needs_recovery {
             txbuild::retry_unknown_submission(&self.keys, &self.params, &self.rest, submission)
-                .await;
+                .await
+        } else {
+            txbuild::submit_new_prepared(&self.keys, &self.rest, submission).await
+        };
         self.sending = false;
 
         match result {
@@ -820,6 +869,7 @@ impl GameApp {
                 });
             }
             Ok(txbuild::RunTxStatus::SubmissionUnknown(submission)) => {
+                self.pending_needs_recovery = true;
                 self.pending_action = Some(match action {
                     PendingAction::UnknownIssuance { asset_ids, .. } => {
                         PendingAction::UnknownIssuance {
@@ -862,6 +912,7 @@ impl GameApp {
                 if optimistic_balance {
                     self.complete_move(direction, sequence, pending.txid);
                 } else {
+                    self.record_move_event(direction, sequence, pending.txid);
                     self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
                     self.log_line(format!("move {} finalized", short_txid(&pending.txid)));
                 }
@@ -887,6 +938,7 @@ impl GameApp {
                 if optimistic_balance {
                     self.complete_move(direction, sequence, txid);
                 } else {
+                    self.record_move_event(direction, sequence, txid);
                     self.next_sequence = self.next_sequence.max(sequence.saturating_add(1));
                     self.log_line(format!("move {} appeared in indexer", short_txid(&txid)));
                 }
@@ -905,6 +957,7 @@ impl GameApp {
             }
         }
         self.pending_action = None;
+        self.pending_needs_recovery = false;
     }
 
     async fn transaction_is_indexed(&self, txid: Txid) -> bool {

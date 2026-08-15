@@ -1,4 +1,4 @@
-import init, { App } from './pkg/arkade_city.js?v=2.1.0';
+import init, { App } from './pkg/arkade_city.js?v=2.2.0';
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -12,6 +12,8 @@ let pendingEnterGame = false;
 let pendingSweep = null;
 let driverGeneration = 0;
 let currentServer = '';
+let driverWakePending = false;
+let driverWakeResolve = null;
 
 function text(id, value) {
   $(id).textContent = String(value ?? '');
@@ -140,6 +142,7 @@ function bindStaticActions() {
     pendingEnterGame = true;
     $('enter-game').disabled = true;
     $('enter-game').textContent = 'Entering…';
+    wakeDriver();
   });
 
   $('import-wallet').addEventListener('click', () => {
@@ -175,6 +178,7 @@ function bindStaticActions() {
     pendingSweep = destination;
     text('wallet-action', 'sweep queued');
     $('sweep-all').disabled = true;
+    wakeDriver();
   });
 
   addEventListener('keydown', (event) => {
@@ -188,7 +192,7 @@ function bindStaticActions() {
     button.addEventListener('click', () => queueMove(Number(button.dataset.dir)));
   }
   addEventListener('beforeunload', (event) => {
-    if (snapshot?.pending || snapshot?.sending) {
+    if (snapshot?.pending || snapshot?.sending || snapshot?.queued || inputQueue.length) {
       event.preventDefault();
       event.returnValue = '';
     }
@@ -197,25 +201,58 @@ function bindStaticActions() {
 
 function queueMove(direction) {
   const totalQueued = (snapshot?.queued ?? 0) + inputQueue.length;
-  if (!snapshot || snapshot.phase !== 'playing' || snapshot.pending || totalQueued >= 16) return;
+  if (!snapshot || snapshot.phase !== 'playing' || totalQueued >= 16) return;
   if ((snapshot.moveBalances?.[direction] ?? 0) <= 0) return;
   inputQueue.push(direction);
   updateQueueCount();
+  if (!snapshot.pending) wakeDriver();
 }
 
 function updateQueueCount() {
-  text('queue-count', (snapshot?.queued ?? 0) + inputQueue.length);
+  const queued = (snapshot?.queued ?? 0) + inputQueue.length;
+  const submitting = snapshot?.pending ?? false;
+  const status = submitting
+    ? queued
+      ? `1 move submitting · ${queued} queued`
+      : '1 move submitting'
+    : queued
+      ? `${queued} move${queued === 1 ? '' : 's'} queued · sending in order`
+      : 'No moves queued';
+  text('queue-status', status);
+  $('queue-status').classList.toggle('active', submitting || queued > 0);
+}
+
+function wakeDriver() {
+  driverWakePending = true;
+  if (driverWakeResolve) {
+    driverWakeResolve();
+    driverWakeResolve = null;
+  }
+}
+
+async function waitForDriver() {
+  if (driverWakePending) {
+    driverWakePending = false;
+    return;
+  }
+  await Promise.race([
+    sleep(1000),
+    new Promise((resolve) => { driverWakeResolve = resolve; }),
+  ]);
+  driverWakeResolve = null;
+  driverWakePending = false;
 }
 
 async function driver(instance, generation) {
   while (app === instance && generation === driverGeneration) {
-    const directions = inputQueue;
+    const wasPending = snapshot?.pending ?? false;
+    const canSendMoves = snapshot?.phase === 'playing' && !wasPending;
+    const directions = canSendMoves ? inputQueue : [];
     const enterGame = pendingEnterGame;
     const sweep = pendingSweep;
-    inputQueue = [];
+    if (canSendMoves) inputQueue = [];
     pendingEnterGame = false;
     pendingSweep = null;
-    updateQueueCount();
     try {
       const nextSnapshot = await withTimeout(
         instance.step(new Uint8Array(directions), enterGame, sweep || undefined),
@@ -235,7 +272,12 @@ async function driver(instance, generation) {
       console.error('game step failed', error);
       showError(`State sync failed: ${String(error)}`);
     }
-    await sleep(1000);
+    const queued = (snapshot?.queued ?? 0) + inputQueue.length;
+    const continueImmediately = (!wasPending && snapshot?.pending)
+      || (wasPending && !snapshot?.pending && queued > 0)
+      || pendingEnterGame
+      || pendingSweep;
+    if (!continueImmediately) await waitForDriver();
   }
 }
 
@@ -291,7 +333,7 @@ function applySnapshot(state) {
   $('enter-game').disabled = state.phase !== 'fund-wallet' || !state.fundingReady || state.pending || state.sending || pendingEnterGame;
   $('enter-game').textContent = entering || pendingEnterGame ? 'Entering…' : 'Enter game';
 
-  const controlsEnabled = state.phase === 'playing' && !state.sending && !state.pending;
+  const controlsEnabled = state.phase === 'playing' && !state.sending;
   for (const button of document.querySelectorAll('[data-dir]')) {
     const direction = Number(button.dataset.dir);
     button.disabled = !controlsEnabled || balances[direction] <= 0;

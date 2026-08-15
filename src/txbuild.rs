@@ -346,6 +346,22 @@ async fn submit_prepared(
     finalize_verified_response(keys, rest, txid, signed_ark, signed_checkpoints).await
 }
 
+/// Submit a transaction that was just durably persisted and has never been
+/// sent to the operator. Ambiguous responses still return `SubmissionUnknown`.
+pub async fn submit_new_prepared(
+    keys: &Keys,
+    rest: &ArkadeRest,
+    prepared: &UnknownSubmission,
+) -> Result<RunTxStatus> {
+    submit_prepared(
+        keys,
+        rest,
+        prepared.signed_ark.clone(),
+        prepared.checkpoints.clone(),
+    )
+    .await
+}
+
 async fn finalize_verified_response(
     keys: &Keys,
     rest: &ArkadeRest,

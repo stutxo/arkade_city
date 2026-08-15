@@ -6,7 +6,7 @@
 
 * { box-sizing: border-box; }
 body { max-width: 760px; margin: auto; padding: 24px 16px 60px; }
-header, .address-row, .game-title, .game-stats, .game-head, .assets, .controls, .action-row { display: flex; align-items: center; gap: 10px; }
+header, .address-row, .game-title, .game-stats, .assets, .controls, .action-row { display: flex; align-items: center; gap: 10px; }
 header { justify-content: space-between; margin-bottom: 22px; }
 h1, h2, h3, p { margin-top: 0; }
 h1 { font-size: 21px; }
@@ -28,12 +28,13 @@ section, .drawer { margin-top: 14px; border: 1px solid #ddd; background: #fff; }
 a { color: inherit; }
 
 .game-panel { padding: 18px; }
-.game-title, .game-head { justify-content: space-between; }
+.game-title { justify-content: space-between; }
 .game-title h2 { margin: 0; }
 .game-stats { color: #666; }
 .assets { margin: 14px 0 8px; justify-content: center; }
 .assets span { padding: 5px 10px; border: 1px solid #ddd; }
-.game-head { justify-content: flex-end; margin-bottom: 6px; font-size: 13px; }
+.queue-status { margin: 10px 0 6px; padding: 8px; border: 1px solid #ddd; text-align: center; font-size: 13px; }
+.queue-status.active { border-color: #111; font-weight: 650; }
 canvas { display: block; width: min(100%, 560px); aspect-ratio: 1; margin: auto; border: 1px solid #888; background: #111; image-rendering: crisp-edges; }
 .controls { justify-content: center; margin-top: 10px; }
 .controls button { width: 52px; }
