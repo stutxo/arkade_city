@@ -263,11 +263,21 @@ impl MatchApp {
                 "that's your own address — open the invite link on the other player's device/browser"
             ));
         }
-        if !self.ensure_game_funded().await? {
-            self.phase = Phase::JoinFunding;
-            self.opponent_addr = Some(host);
-            self.log_line("funding game key; will send START when it lands");
-            return Ok(());
+        // Enter the funding phase *before* the check so the poll loop keeps
+        // retrying: as soon as the master wallet lands funds, the join
+        // proceeds by itself.
+        self.opponent_addr = Some(host);
+        self.phase = Phase::JoinFunding;
+        match self.ensure_game_funded().await {
+            Ok(true) => {}
+            Ok(false) => {
+                self.log_line("funding game key; will send START when it lands");
+                return Ok(());
+            }
+            Err(e) => {
+                self.log_line(format!("join: {e:#}"));
+                return Ok(());
+            }
         }
         if self.adopt_existing_start(host).await? {
             return Ok(());
