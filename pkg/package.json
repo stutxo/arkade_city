@@ -1,0 +1,17 @@
+{
+  "name": "arkade-duel",
+  "type": "module",
+  "version": "0.1.0",
+  "license": "MIT",
+  "files": [
+    "arkade_duel_bg.wasm",
+    "arkade_duel.js",
+    "arkade_duel.d.ts"
+  ],
+  "main": "arkade_duel.js",
+  "types": "arkade_duel.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ],
+  "private": true
+}

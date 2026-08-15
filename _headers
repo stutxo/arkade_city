@@ -1,0 +1,8 @@
+# Cloudflare Pages / GitHub Pages-style cache control.
+# The pkg/ filenames are stable across builds, so never cache them hard.
+/pkg/*
+  cache-control: no-cache
+/*.html
+  cache-control: no-cache
+/web.js
+  cache-control: no-cache

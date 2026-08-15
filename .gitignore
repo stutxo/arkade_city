@@ -1,0 +1,6 @@
+/target/
+/.arkade-wallet/
+.env
+*.log
+.arkade-smoke-key
+/.toolchain/

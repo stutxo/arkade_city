@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Arkade Duel</title>
+  <link rel="stylesheet" href="game.css">
+</head>
+<body>
+  <main>
+    <h1>ARKADE DUEL <span id="version" class="ver"></span></h1>
+    <p class="tagline">serverless 1v1 &middot; every move is an Arkade transaction</p>
+
+    <section id="wallet">
+      <div class="row"><span class="label">your address</span>
+        <code id="address">…</code>
+        <button id="copy-addr" class="mini">copy</button>
+      </div>
+      <div class="row"><span class="label">balance</span><code id="balance">…</code></div>
+      <div class="row"><span class="label">network</span>
+        <span id="net-badge" class="badge">…</span>
+        <button id="net-btn" class="mini">switch to signet</button>
+      </div>
+      <div id="net-warn" class="warn hidden"></div>
+      <details>
+        <summary>recovery key</summary>
+        <code id="recovery-key" class="secret"></code>
+        <p class="warn">MAINNET — real bitcoin. Anyone with this key can spend the wallet. Keep tiny amounts only.</p>
+      </details>
+    </section>
+
+    <section id="home">
+      <button id="host-btn">HOST NEW GAME</button>
+      <div id="host-link-row" class="hidden">
+        <span class="label">send this link</span>
+        <code id="host-link"></code>
+        <button id="copy-link" class="mini">copy</button>
+      </div>
+      <div id="join-row" class="hidden">
+        <p>challenge from <code id="join-addr"></code></p>
+        <button id="join-btn">ACCEPT &amp; SEND START TX</button>
+      </div>
+    </section>
+
+    <section id="arena" class="hidden">
+      <canvas id="canvas" width="800" height="450"></canvas>
+      <p class="hint">WASD move &middot; SPACE fire &middot; one hit wins</p>
+    </section>
+
+    <section id="status">
+      <div class="row"><span class="label">phase</span><code id="phase">idle</code></div>
+      <div class="row"><span class="label">match</span><code id="match-id">—</code></div>
+      <div class="row"><span class="label">chain sync</span><code id="sync">never</code></div>
+      <button id="reset-btn" class="mini">reset match state</button>
+      <div id="result" class="hidden"></div>
+    </section>
+
+    <section id="log-wrap">
+      <h2>chain log</h2>
+      <ul id="log"></ul>
+    </section>
+  </main>
+  <script type="module" src="web.js"></script>
+</body>
+</html>

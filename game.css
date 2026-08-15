@@ -1,0 +1,90 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b0d10;
+  --panel: #14171c;
+  --line: #23272e;
+  --text: #d7dde4;
+  --dim: #8b949e;
+  --accent: #6fd3ff;
+  --danger: #e25563;
+  --gold: #ffd166;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+main {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 24px 16px 64px;
+}
+
+h1 { letter-spacing: 0.3em; margin: 0 0 4px; }
+h2 { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.15em; }
+.tagline { color: var(--dim); margin-top: 0; }
+
+section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 16px 0;
+}
+
+.row { display: flex; align-items: center; gap: 10px; margin: 6px 0; flex-wrap: wrap; }
+.label { color: var(--dim); min-width: 110px; }
+
+code {
+  background: #0e1116;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 6px;
+  word-break: break-all;
+}
+
+.secret { display: block; margin: 8px 0; }
+.warn { color: var(--gold); font-size: 12px; }
+
+button {
+  background: var(--accent);
+  color: #06121a;
+  border: 0;
+  border-radius: 6px;
+  padding: 12px 20px;
+  font: inherit;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.5; cursor: wait; }
+button.mini { padding: 4px 10px; font-weight: 400; }
+
+canvas {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.hint { color: var(--dim); text-align: center; font-size: 12px; }
+.hidden { display: none; }
+
+#result { text-align: center; font-size: 28px; font-weight: 700; padding: 12px; }
+#result.win { color: var(--accent); }
+#result.lose { color: var(--danger); }
+
+#log { list-style: none; margin: 0; padding: 0; font-size: 12px; color: var(--dim); }
+#log li { padding: 3px 0; border-bottom: 1px solid var(--line); word-break: break-all; }
+
+.ver { font-size: 11px; color: var(--dim); letter-spacing: 0; }
+
+.badge { padding: 2px 10px; border-radius: 10px; font-size: 11px; font-weight: 700; letter-spacing: 0.1em; }
+.badge.mainnet { background: #e25563; color: #fff; }
+.badge.signet { background: #2ea043; color: #fff; }

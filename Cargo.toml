@@ -1,0 +1,44 @@
+[package]
+name = "arkade-duel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+license = "MIT"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+ark-core = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
+base64 = "0.22"
+bech32 = "0.11"
+bitcoin = { version = "0.32.7", features = ["rand", "serde", "base64"] }
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["console", "Storage", "Window", "Headers", "Request", "RequestInit", "Response"] }
+
+[dev-dependencies]
+
+# Native transport for tests/tools; the WASM build uses web-sys fetch.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
