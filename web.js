@@ -300,7 +300,6 @@ function applySnapshot(state) {
     button.disabled = !controlsEnabled || balances[direction] <= 0;
   }
   $('sweep-all').disabled = state.pending || state.sending || state.balance <= 0;
-  text('board-status', state.pending ? `pending ${state.pendingTxid || ''}` : state.phase);
   renderVtxos(state.walletVtxos || []);
 }
 
