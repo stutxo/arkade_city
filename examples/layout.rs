@@ -27,6 +27,7 @@ async fn main() -> Result<()> {
         is_swept: false,
         is_unrolled: false,
         expires_at: None,
+        created_at: None,
         ark_txid: None,
         spent_by: None,
     };
@@ -37,7 +38,7 @@ async fn main() -> Result<()> {
         gamelog::registration_player_script(&issuance.unsigned_tx, &game_script, params.dust_sats,),
         Some(script.clone())
     );
-    print_outputs("REGISTER + ISSUE 50 W/A/S/D", &issuance);
+    print_outputs("REGISTER + ISSUE W/D/S/A/BULLET/LIFE", &issuance);
 
     let carrier = VtxoRecord {
         outpoint: bitcoin::OutPoint {
@@ -48,13 +49,15 @@ async fn main() -> Result<()> {
         amount_sats: params.dust_sats,
         assets: assets
             .iter()
-            .map(|asset| (asset.to_string(), txbuild::MOVE_SUPPLY))
+            .enumerate()
+            .map(|(index, asset)| (asset.to_string(), txbuild::ACTION_SUPPLIES[index]))
             .collect(),
         is_spent: false,
         is_preconfirmed: true,
         is_swept: false,
         is_unrolled: false,
         expires_at: None,
+        created_at: None,
         ark_txid: None,
         spent_by: None,
     };

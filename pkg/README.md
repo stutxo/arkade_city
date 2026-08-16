@@ -1,210 +1,153 @@
 # Arkade City
 
-Arkade City is an endless multiplayer map reconstructed entirely from Arkade
-transactions. Every browser runs the same static Rust/WASM app. There are no
-matches, peers, relays, game servers, or operator changes.
+Arkade City v3 is a finite multiplayer combat arena reconstructed entirely
+from Arkade transactions. Every browser runs the same static Rust/WASM replay.
+There is no game server, lobby, host, relay, peer connection, or modified
+coordinator.
 
-Play the Mutinynet build at <https://stutxo.github.io/arkade_city/>.
-
-```text
-player browsers
-  keys + transaction builder + maze replay
-             |
-             v
-      Arkade Mutinynet
-             |
-             +-- one NUMS-owned player registry
-             |
-             `-- registered player VTXO scripts
-                    containing native asset burns
-```
-
-The hard-coded registry address is:
+The Mutinynet build uses the existing operator-specific NUMS registry:
 
 ```text
 tark1qqcpq7yq3e8hhsx6ml3fud93m7827qggaurtzu3zwsr4a0qs0gf85xacghv2fqfrv43e4mgekvqq6ul7u65wm8u7tk3t67kl9syxt822nw9wzn
 ```
 
-Its P2TR script is:
+Its P2TR script is
+`51201bb845d8a4812365639aed19b3000d73fee6a8ed9f9e5da2bd7adf2c08659d4a`.
+The owner is Arkade's BIP341 NUMS key. The operator may sweep registration
+backing sats after expiry. `cargo run --example burnaddr` recomputes the address.
+
+## Playing
+
+1. Open the page. A wallet key is generated and stored in origin-local browser
+   storage.
+2. Fund the displayed Arkade address with at least 660 sats.
+3. Click **Enter game**. The app creates a 330-sat registry output and a
+   reusable 330-sat player carrier.
+4. Choose an action whenever the previous carrier is indexed and available:
+   W/A/S/D to move and face, Space to shoot, or R to revive.
+5. Sweep remaining sats and assets before forgetting a wallet.
+
+Every player starts with 3 HP, faces right, and spawns deterministically from
+the issuance txid onto an open cell. Indexed actions resolve sequentially. A
+shot removes 1 HP, and a transition to zero awards the shooter a kill. A miss
+stops at the first wall, house, or boundary.
+Overlapping targets are resolved by
+the lexicographically lowest player ID. Dead movement and shooting are
+no-ops after the asset is burned. Revive preserves kills, restores 3 HP at the
+deterministic spawn, and faces right. Players may overlap. The leaderboard sorts
+by kills descending, then player ID ascending.
+
+## V3 Protocol
+
+The fresh protocol identifier is `arkade-arena-v3`. V2 registrations and
+assets at the same registry are ignored. A canonical registration issues six
+immutable groups to output 1:
+
+| Group | Metadata action | Supply | Meaning |
+| --- | --- | ---: | --- |
+| 0 | `w` | 50 | move/facing up |
+| 1 | `d` | 50 | move/facing right |
+| 2 | `s` | 50 | move/facing down |
+| 3 | `a` | 50 | move/facing left |
+| 4 | `bullet` | 50 | shoot |
+| 5 | `life` | 5 | revive |
+
+Each group has exact metadata `game=arkade-arena-v3` and `action=<name>`, no
+control asset, no inputs, and one assignment of its exact supply to player
+output 1. The transaction structure remains:
 
 ```text
-51201bb845d8a4812365639aed19b3000d73fee6a8ed9f9e5da2bd7adf2c08659d4a
+output 0: 330 sats -> operator-specific NUMS registry
+output 1: 330 sats + all six asset groups -> player script
+change:   optional operator-valid BTC-only output -> player script
+packet:   one canonical immutable issuance containing all six groups
 ```
 
-The address is a standard Arkade VTXO whose owner is Arkade's BIP341 NUMS
-key. Its virtual spending paths require the unknown NUMS private key. Each new
-player sends one 330-sat registration output there. The operator may sweep its
-backing sats after expiry. Anyone can recompute it with:
+An action transaction burns exactly one unit of its corresponding group,
+preserves every other unit on output 0 of the recreated 330-sat player carrier,
+and carries one `AM` v3 receipt with a little-endian `u32` player sequence.
+Sequence starts at zero. Duplicate sequence claims resolve by indexed
+`(createdAt, txid)` along the checkpoint-aware predecessor chain, and replay
+stops at the first gap. This carrier chain always retains every canonical burn
+for inventory and next-sequence continuity, including gameplay no-ops.
+
+## Discovery And Ordering
+
+Clients paginate the registry without trusting API page order, validate v3
+registrations, query all registered player scripts, and validate each creating
+virtual transaction. Accepted events are first reduced to each player's
+canonical contiguous sequence and predecessor stream. Every canonical action
+with a parseable timestamp enters gameplay exactly once. Actions are sorted
+globally by `(createdAt, txid)` and applied one at a time. Movement updates
+facing and then advances one open cell, shots raycast against the state at that
+point, and revives restore dead players while preserving kills.
+
+Clients serialize local input until the prior carrier is indexed and available,
+with no queued, submitted, or tentative action. Indexer latency is accepted as
+part of play rather than hidden behind a time bucket.
+
+Coordinator ordering is a trust boundary. The coordinator does not run the game
+or calculate combat, but it can influence outcomes by delaying, omitting, or
+timestamping indexed transactions. A
+remote action with no parseable `createdAt` is not replayed and blocks later
+actions in that player's authoritative stream. A locally finalized action does
+not affect arena state until the indexer supplies `createdAt`. Later historical
+indexer data can insert an action earlier in global order and change the replay.
+There is no independent consensus beyond the selected Arkade indexer.
+
+## Arena
+
+The arena is one fixed 21x21 layout in every browser. Boundary cells, scattered
+barriers, and four recognizable solid houses block movement and shots. The map
+is not randomized. The browser renders a smaller camera viewport following the
+local player. Selected movement previews its adjacent destination and facing;
+selected shots preview the full ray and endpoint; revive has a local indicator.
+These previews bridge indexer lag and never mutate authoritative position, HP,
+or kills. Snapshots expose `canAct`, optional `projectedAction`, and a bounded
+recent shot-trace list.
+Each trace is identified by its action txid; camera state remains browser-local.
+
+## Persistence And Recovery
+
+V3 uses `arkade-arena:wallet:v3` and `arkade-arena:pending:v3` browser storage
+namespaces plus pending journal version 3. V2 pending state is therefore never
+silently restored. Signed Ark and checkpoint PSBTs are persisted before first
+submission, and recovery retries the identical transaction and txid. Browser
+storage is plaintext and wallet-sensitive.
+
+## Build And Test
+
+Rust 1.86+, Node.js, `wasm-pack`, the `wasm32-unknown-unknown` target, and a
+clang with wasm32 support are required.
 
 ```sh
-cargo run --example burnaddr
-```
-
-## How Play Works
-
-1. Opening the page creates an Arkade wallet and stores its key in browser
-   storage. Returning to Mutinynet restores that wallet and dot.
-2. Fund the displayed wallet with at least 660 sats over Arkade.
-3. Once the wallet is funded, click **Enter game**. The app creates one
-   registration transaction with a 330-sat registry marker and a 330-sat
-   player carrier holding 50 W, 50 A, 50 S, and 50 D assets.
-4. Never manually send funds to the registry address. Only fund the player
-   address displayed by the app.
-5. Each keypress protocol-burns one unit of the matching asset and recreates
-   the same 330-sat carrier on the player's script.
-6. Every client reads the registry, batches queries for all registered player
-   scripts, validates their burns, and replays the maze.
-7. Reaching the right-side exit records one lap and returns the dot to the
-   entrance. The shared board never ends.
-
-The 660-sat minimum is one 330-sat registration plus one reusable 330-sat
-carrier. A move does not transfer sats to the registry. The carrier remains in
-the player's wallet across all 200 moves and can be recovered afterward,
-subject to Arkade expiry and any future operator fees.
-
-Registration inputs must total exactly 660 sats or leave change accepted by
-the operator's VTXO minimum. Mutinynet permits one-sat VTXOs, so change below
-330 sats is encoded as a recoverable sub-dust output. Prefer funding amounts
-that leave at least 330 sats of change when possible.
-
-The wallet key and pending-transaction journal are stored in `localStorage`.
-A recovery bundle with the raw key, address, signer, exit delay, and pending
-journal is also shown in the UI. Use "Forget wallet" only after recovering or
-sweeping any remaining funds. Browser storage is plaintext origin storage, so
-treat the browser profile and every script served on the same origin as
-wallet-sensitive.
-
-Transactions cross a durable boundary before submission. Rust first signs the
-exact Ark and checkpoint PSBTs locally. `web.js` writes and verifies that
-journal in browser storage; only the following tick may query
-`/v1/tx/pending`, submit, or finalize it. Reloading during registration, a move,
-or a sweep therefore retries the same txid instead of rebuilding it.
-
-## Registration Protocol
-
-Each player's four immutable assets share one issuance txid, which is also the
-player ID. Group indexes are:
-
-The on-chain `arkade-maze-v2` identifier is retained so the renamed app can
-continue replaying existing registrations and moves.
-
-| Group | Asset metadata | Direction |
-| --- | --- | --- |
-| `0` | `game=arkade-maze-v2`, `move=w` | up |
-| `1` | `game=arkade-maze-v2`, `move=d` | right |
-| `2` | `game=arkade-maze-v2`, `move=s` | down |
-| `3` | `game=arkade-maze-v2`, `move=a` | left |
-
-A canonical registration transaction contains:
-
-```text
-output 0: 330 sats -> NUMS registry
-output 1: 330 sats + 50 of each move asset -> player script
-change:   optional output at least equal to the VTXO minimum -> player script
-packet:   one immutable issuance group per direction
-anchor:   final output
-```
-
-Clients require exactly one registry output at index zero, exactly one player
-asset carrier at index one, four non-reissuable groups, canonical metadata,
-and exactly 50 units assigned to the player carrier. Other outputs on the
-registry address are ignored.
-
-## Move Protocol
-
-A canonical move transaction contains:
-
-```text
-input:       current 330-sat player carrier
-output 0:    same 330-sat carrier -> registered player script
-OP_RETURN 1: Arkade Asset V1 extension packet
-OP_RETURN 2: 41 4d | 02 | sequence(u32 little endian)
-anchor:      final output
-```
-
-The packet consumes the carrier's assets, preserves every unburned unit on
-output zero, and has an input-minus-output deficit of exactly one unit for one
-direction group. This is Arkade's native asset-burn mechanism, so indexed
-supply decreases while the BTC carrier returns to the player.
-
-The burned asset identifies the player by issuance txid and direction by
-group index. The receipt only orders that player's moves. Players do not
-collide, so no global order is needed. Duplicate sequence numbers are resolved
-by txid, and replay stops at the first sequence gap.
-
-## Discovery
-
-A fresh client performs two existing indexer queries:
-
-1. Paginate every VTXO for the registry script and validate registration
-   transactions.
-2. Query the discovered player scripts in batches using repeated `scripts`
-   query parameters, fetch each creating virtual transaction, and accept only
-   canonical one-unit burns.
-
-This provides complete historical replay without an asset-event endpoint.
-Unresolved transaction fetches are retried. Active clients stop pagination at
-known pages and periodically perform a full scan to tolerate shifting page
-boundaries. Controls remain disabled until the local player's script has been
-fully scanned and every local record has been resolved, preventing stale
-sequence numbers from irreversibly burning assets.
-
-## Build And Run
-
-Rust 1.86+, `wasm-pack`, the `wasm32-unknown-unknown` target, and a clang with
-wasm32 support are required.
-
-```sh
+cargo fmt --check
+cargo test --lib
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+node --check web.js
 ./build.sh
 python3 -m http.server 8000
 ```
 
-Open `http://localhost:8000`. All copies use the same hard-coded Mutinynet
-operator and registry.
-
-To fund the displayed `tark1...` address, open
-`https://faucet.mutinynet.com` and use its separate **Send to Arkade** form.
-Do not paste an Arkade address into the faucet's on-chain destination field.
-
-## Tests
+The funded local browser E2E remains isolated behind `regtest-e2e`:
 
 ```sh
-cargo test --lib
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo run --example layout
-cargo run --example smoke
-./build.sh
+git submodule update --init
+./scripts/test-regtest.sh
 ```
 
-## Repository Layout
-
-| Path | Purpose |
-| --- | --- |
-| `src/lib.rs` | Mutinynet-pinned WASM API, restoration, and journal export |
-| `src/match_.rs` | durable wallet actions, registry polling, lifecycle, and replay |
-| `src/game.rs` | deterministic square maze and endless lap rules |
-| `src/gamelog.rs` | registration, burn, receipt, and sequence validation |
-| `src/txbuild.rs` | registration issuance, protocol burns, signing, and finalization |
-| `src/arkade.rs` | paginated and batched Arkade REST/indexer client |
-| `index.html`, `web.js`, `game.css` | static browser interface |
+It builds `pkg-regtest/`, funds a browser wallet, reloads after prepared
+issuance/action/sweep journals, verifies that the indexed move changes the
+authoritative local coordinates, and checks the six v3 balances and recipient
+assets. Manual helpers are available through `./scripts/regtest.sh`. The normal
+build and Pages workflow continue to package only the Mutinynet build.
 
 ## Limits
 
-- This is alpha software on Mutinynet. Registration irreversibly removes
-  330 sats from the player's wallet; moves do not.
-- History grows with both players and moves. A fresh client reads every
-  registration and every registered player's VTXO history.
-- Anyone can create a canonical registration and appear as a new player. There
-  is no admission control, identity system, or anti-spam layer.
-- The operator validates asset conservation and transactions, not maze rules.
-  Every browser applies maze rules locally.
-- There is no boarding, settlement, renewal, or unilateral exit flow in this
-  browser client.
-- Lost submit responses are recovered through the operator's existing
-  `/v1/tx/pending` ownership proof and the identical transaction is resubmitted
-  only when no pending copy exists. The browser persists the pending journal so
-  a reload can resume recovery or finalization.
-- Sweep sends every safely collaborative-spendable sat and asset to another
-  Mutinynet Arkade address. Boarding, settlement, renewal, unilateral exit, and
-  recovery of swept or sub-dust VTXOs still require a full Arkade wallet.
+- Registration relinquishes 330 sats; the 330-sat carrier remains subject to
+  Arkade expiry and future operator policy.
+- Anyone can create a canonical registration. There is no identity, admission,
+  anti-spam, or asset non-transferability mechanism.
+- Fresh clients read all registrations and registered player histories.
+- Boarding, settlement, renewal, and unilateral exit are outside this client.

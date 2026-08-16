@@ -31,13 +31,14 @@ dependencies = [
 
 [[package]]
 name = "arkade-city"
-version = "0.1.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "ark-core",
  "base64 0.22.1",
  "bitcoin",
  "console_error_panic_hook",
+ "futures-util",
  "getrandom 0.2.17",
  "js-sys",
  "rand 0.8.7",

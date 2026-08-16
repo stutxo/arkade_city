@@ -1,6 +1,6 @@
 [package]
 name = "arkade-city"
-version = "0.1.0"
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.86"
 publish = false
@@ -13,6 +13,11 @@ wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 name = "arkade_city"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+# Test-only escape hatch for the isolated local browser E2E package.
+regtest-e2e = []
+
 [dependencies]
 anyhow = "1"
 ark-core = { git = "https://github.com/arkade-os/rust-sdk", rev = "adcb5a8c76ebb14145cddcb0bb685973bc2a981c" }
@@ -20,6 +25,7 @@ base64 = "0.22"
 bitcoin = { version = "0.32.7", features = ["rand", "serde", "base64"] }
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.2", features = ["js"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 js-sys = "0.3"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +33,7 @@ serde_json = "1"
 serde-wasm-bindgen = "0.6"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["AbortSignal", "console", "Window", "Headers", "Request", "RequestInit", "Response"] }
+web-sys = { version = "0.3", features = ["AbortSignal", "console", "Window", "Headers", "Request", "RequestCache", "RequestInit", "Response"] }
 
 [dev-dependencies]
 

@@ -56,6 +56,8 @@ pub struct VtxoRecord {
     pub is_swept: bool,
     pub is_unrolled: bool,
     pub expires_at: Option<i64>,
+    /// Coordinator/indexer creation time used for authoritative arena order.
+    pub created_at: Option<i64>,
     /// Ark transaction that spends this VTXO, when reported by the indexer.
     /// The creating virtual transaction is always `outpoint.txid`.
     pub ark_txid: Option<String>,
@@ -126,6 +128,8 @@ struct IndexerVtxo {
     is_unrolled: Option<bool>,
     #[serde(rename = "expiresAt")]
     expires_at: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
     #[serde(rename = "arkTxid")]
     ark_txid: Option<String>,
     #[serde(rename = "spentBy")]
@@ -193,12 +197,25 @@ struct FinalizeTxRequest<'a> {
     final_checkpoint_txs: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+enum FetchCache {
+    Default,
+    NoStore,
+}
+
 #[cfg(target_arch = "wasm32")]
-async fn fetch_text(method: &str, url: &str, body: Option<String>) -> Result<String> {
-    web_log!("arkade request start: {method} {url}");
+async fn fetch_text(
+    method: &str,
+    url: &str,
+    body: Option<String>,
+    cache: FetchCache,
+) -> Result<String> {
     let window = web_sys::window().ok_or_else(|| anyhow!("no window"))?;
     let init = web_sys::RequestInit::new();
     init.set_method(method);
+    if matches!(cache, FetchCache::NoStore) {
+        init.set_cache(web_sys::RequestCache::NoStore);
+    }
     let signal = web_sys::AbortSignal::timeout_with_u32(REQUEST_TIMEOUT_MS as u32);
     init.set_signal(Some(&signal));
     if let Some(body) = body {
@@ -226,20 +243,28 @@ async fn fetch_text(method: &str, url: &str, body: Option<String>) -> Result<Str
     if !resp.ok() {
         return Err(anyhow!("{method} {url} failed ({status}): {text}"));
     }
-    web_log!("arkade request complete: {method} {url} ({status})");
     Ok(text)
 }
 
 /// Native transport, used by tests and tooling. Same REST wire format.
 #[cfg(not(target_arch = "wasm32"))]
-async fn fetch_text(method: &str, url: &str, body: Option<String>) -> Result<String> {
-    web_log!("arkade request start: {method} {url}");
+async fn fetch_text(
+    method: &str,
+    url: &str,
+    body: Option<String>,
+    cache: FetchCache,
+) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS as u64))
         .build()?;
     let req = match method {
         "POST" => client.post(url),
         _ => client.get(url),
+    };
+    let req = if matches!(cache, FetchCache::NoStore) {
+        req.header(reqwest::header::CACHE_CONTROL, "no-cache")
+    } else {
+        req
     };
     let req = match body {
         Some(b) => req.header("content-type", "application/json").body(b),
@@ -251,7 +276,6 @@ async fn fetch_text(method: &str, url: &str, body: Option<String>) -> Result<Str
     if !status.is_success() {
         return Err(anyhow!("{method} {url} failed ({status}): {text}"));
     }
-    web_log!("arkade request complete: {method} {url} ({status})");
     Ok(text)
 }
 
@@ -290,7 +314,13 @@ impl ArkadeRest {
     }
 
     pub async fn get_info(&self) -> Result<ServerParams> {
-        let text = fetch_text("GET", &format!("{}/v1/info", self.base), None).await?;
+        let text = fetch_text(
+            "GET",
+            &format!("{}/v1/info", self.base),
+            None,
+            FetchCache::Default,
+        )
+        .await?;
         let info: InfoResponse = serde_json::from_str(&text).context("parse /v1/info response")?;
         let signer_pk: bitcoin::PublicKey =
             info.signer_pubkey.parse().context("parse signer pubkey")?;
@@ -394,7 +424,7 @@ impl ArkadeRest {
         if !filter.is_empty() {
             url.push_str(&format!("&{filter}=true"));
         }
-        let text = fetch_text("GET", &url, None).await?;
+        let text = fetch_text("GET", &url, None, FetchCache::NoStore).await?;
         let resp: GetVtxosResponse = serde_json::from_str(&text).context("parse vtxos")?;
         let mut out = Vec::new();
         for v in resp.vtxos.unwrap_or_default() {
@@ -436,6 +466,7 @@ impl ArkadeRest {
                 is_swept: v.is_swept.unwrap_or(false),
                 is_unrolled: v.is_unrolled.unwrap_or(false),
                 expires_at: v.expires_at.and_then(|value| value.parse().ok()),
+                created_at: v.created_at.and_then(|value| value.parse().ok()),
                 ark_txid: v.ark_txid,
                 spent_by: v.spent_by,
             });
@@ -495,7 +526,7 @@ impl ArkadeRest {
             return Ok(vec![]);
         }
         let url = format!("{}/v1/indexer/virtualTx/{}", self.base, txids.join(","));
-        let text = fetch_text("GET", &url, None).await?;
+        let text = fetch_text("GET", &url, None, FetchCache::NoStore).await?;
         let resp: GetVirtualTxsResponse =
             serde_json::from_str(&text).context("parse virtual txs")?;
         resp.txs
@@ -534,7 +565,13 @@ impl ArkadeRest {
                 .map(|p| b64.encode(p.serialize()))
                 .collect(),
         })?;
-        let text = fetch_text("POST", &format!("{}/v1/tx/submit", self.base), Some(body)).await?;
+        let text = fetch_text(
+            "POST",
+            &format!("{}/v1/tx/submit", self.base),
+            Some(body),
+            FetchCache::Default,
+        )
+        .await?;
         let resp: SubmitTxResponse = serde_json::from_str(&text).context("parse submit resp")?;
         let final_ark = resp
             .final_ark_tx
@@ -578,7 +615,13 @@ impl ArkadeRest {
                 proof: intent.serialize_proof(),
             },
         })?;
-        let text = fetch_text("POST", &format!("{}/v1/tx/pending", self.base), Some(body)).await?;
+        let text = fetch_text(
+            "POST",
+            &format!("{}/v1/tx/pending", self.base),
+            Some(body),
+            FetchCache::Default,
+        )
+        .await?;
         let response: GetPendingTxResponse =
             serde_json::from_str(&text).context("parse pending tx response")?;
         let b64 = base64::engine::general_purpose::STANDARD;
@@ -630,7 +673,13 @@ impl ArkadeRest {
                 .map(|p| b64.encode(p.serialize()))
                 .collect(),
         })?;
-        fetch_text("POST", &format!("{}/v1/tx/finalize", self.base), Some(body)).await?;
+        fetch_text(
+            "POST",
+            &format!("{}/v1/tx/finalize", self.base),
+            Some(body),
+            FetchCache::Default,
+        )
+        .await?;
         Ok(())
     }
 }

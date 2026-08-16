@@ -5,12 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#ffffff">
   <title>Arkade City</title>
-  <link rel="stylesheet" href="game.css?v=2.3.1">
+  <link rel="stylesheet" href="game.css?v=3.0.0">
 </head>
 <body>
   <header>
     <h1>Arkade City <small id="version"></small></h1>
-    <b id="network-label">Mutinynet</b>
+    <div class="header-actions">
+      <b id="network-label">Mutinynet</b>
+      <a class="github-button" href="https://github.com/stutxo/arkade_city" target="_blank" rel="noreferrer">GitHub</a>
+    </div>
   </header>
 
   <p id="boot-error" class="error hidden"></p>
@@ -24,7 +27,7 @@
         <button id="copy-wallet">Copy</button>
       </div>
       <p id="funding-note">Checking wallet balance…</p>
-      <p class="help">Use <a href="https://faucet.mutinynet.com" target="_blank" rel="noreferrer">Mutinynet Faucet → Send to Arkade</a>. Do not use the on-chain address field.</p>
+      <p id="funding-help" class="help">Use <a href="https://faucet.mutinynet.com" target="_blank" rel="noreferrer">Mutinynet Faucet → Send to Arkade</a>. Do not use the on-chain address field.</p>
       <button id="enter-game" class="primary" disabled>Enter game</button>
       <p class="fine-print">Only fund your player address above. Enter Game creates the registration transaction for you; never manually send to the registry address.</p>
     </section>
@@ -32,27 +35,42 @@
     <section class="game-panel">
       <div class="game-title">
         <div>
-          <p class="eyebrow">Shared world</p>
-          <h2>City grid</h2>
+          <p class="eyebrow">Transaction arena</p>
+          <h2>Combat grid</h2>
         </div>
-        <div class="game-stats"><span><b id="player-count">0</b> players</span><span><b id="event-count">0</b> moves</span></div>
+        <div class="game-stats"><span><b id="player-count">0</b> players</span><span><b id="event-count">0</b> actions</span></div>
       </div>
 
-      <div id="queue-status" class="queue-status">No moves queued</div>
-      <div id="projection-status" class="projection-status hidden"></div>
-      <canvas id="canvas" width="520" height="520" aria-label="Shared Arkade city grid"></canvas>
+      <div class="hud"><span class="health-hud">HP <span class="hp-pips" aria-hidden="true"><i></i><i></i><i></i></span> <small><b id="local-hp">-</b>/<b id="max-hp">3</b></small></span><span>Kills <b id="local-kills">0</b></span><span id="move-stock">Moves <b id="move-total">0</b></span><span id="ammo-stock">Ammo <b id="asset-bullet">0</b></span><span>Lives <b id="asset-life">0</b></span></div>
+      <canvas id="canvas" width="620" height="620" aria-label="Shared Arkade combat arena"></canvas>
       <div class="controls" aria-label="Movement controls">
         <button data-dir="0"><strong>W</strong><small>$W · <b id="asset-w">0</b></small></button>
         <button data-dir="3"><strong>A</strong><small>$A · <b id="asset-a">0</b></small></button>
         <button data-dir="2"><strong>S</strong><small>$S · <b id="asset-s">0</b></small></button>
         <button data-dir="1"><strong>D</strong><small>$D · <b id="asset-d">0</b></small></button>
       </div>
+      <div class="combat-controls">
+        <button id="shoot" data-action="4"><strong>Shoot</strong><small>Space · <b id="shoot-balance">0</b> bullets</small></button>
+        <button id="revive" data-action="5"><strong>Revive</strong><small>R · <b id="revive-balance">0</b> lives</small></button>
+      </div>
+      <div id="queue-status" class="queue-status">Ready</div>
+      <div class="leaderboard-wrap">
+        <h3>Leaderboard</h3>
+        <ol id="leaderboard"><li>No players yet</li></ol>
+      </div>
     </section>
 
     <details class="drawer">
       <summary>How entering the game works</summary>
-      <p>After you click Enter Game, Arkade City uses 330 sats to publish a registration marker and keeps another 330 sats in your player wallet as the reusable move-asset carrier.</p>
+      <p>After you click Enter Game, Arkade City uses 330 sats to publish a registration marker and keeps another 330 sats in your player wallet as the reusable action-asset carrier.</p>
       <p>You only send funds to your own player address. The app handles the shared registry output inside the registration transaction. Moves do not pay the registry.</p>
+    </details>
+
+    <details class="drawer">
+      <summary>How actions are tracked</summary>
+        <p>W, D, S, A, bullets, and lives are six immutable Arkade asset groups. Every action burns exactly one matching unit and carries that player's next contiguous sequence number.</p>
+        <p>There is no game server, host, or relay. Browsers validate every burn for inventory continuity, then replay all indexed actions sequentially in global <code>(createdAt, txid)</code> order. Later historical indexer data can change that replay.</p>
+        <p>Your selected action is previewed immediately, but authoritative position, HP, and kills change only after the indexer supplies its timestamp. The preview remains visible while indexing catches up.</p>
     </details>
 
     <details class="drawer">
@@ -115,6 +133,6 @@
     </details>
   </main>
 
-  <script type="module" src="web.js?v=2.3.1"></script>
+  <script type="module" src="web.js?v=3.0.0-fast2"></script>
 </body>
 </html>

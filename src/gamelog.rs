@@ -9,14 +9,13 @@ use ark_core::asset::AssetId;
 use bitcoin::hashes::Hash;
 use bitcoin::opcodes::all::OP_RETURN;
 use bitcoin::script::Instruction;
-use bitcoin::{Transaction, Txid};
+use bitcoin::{OutPoint, Transaction, Txid};
 use std::collections::{BTreeMap, HashSet};
 
-pub const GAME_ID: &str = "arkade-maze-v2";
+pub const GAME_ID: &str = "arkade-arena-v3";
 pub const RECEIPT_MAGIC: &[u8; 2] = b"AM";
-pub const RECEIPT_VERSION: u8 = 2;
+pub const RECEIPT_VERSION: u8 = 3;
 pub const RECEIPT_LEN: usize = 2 + 1 + 4;
-pub const MOVE_SUPPLY: u64 = 50;
 pub const PLAYER_ASSET_OUTPUT_INDEX: u16 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,13 +67,17 @@ pub struct MoveEvent {
     pub txid: Txid,
     pub player: Txid,
     pub sequence: u32,
-    pub direction: u8,
+    pub action: u8,
+    pub predecessor: OutPoint,
+    pub created_at: Option<i64>,
+    pub local_tentative: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MoveBurn {
     pub receipt: MoveReceipt,
     pub asset_id: AssetId,
+    pub predecessor: OutPoint,
     pub preserved_output_indexes: Vec<u16>,
 }
 
@@ -268,22 +271,22 @@ pub fn asset_packet_from_tx(tx: &Transaction) -> Option<AssetPacket> {
     packet
 }
 
-fn direction_from_pairs(metadata: &[(String, String)], group_index: u16) -> Option<u8> {
-    let direction = u8::try_from(group_index).ok()?;
-    let expected = crate::game::DIRECTIONS.get(direction as usize)?.to_string();
+fn action_from_pairs(metadata: &[(String, String)], group_index: u16) -> Option<u8> {
+    let action = u8::try_from(group_index).ok()?;
+    let expected = crate::game::ACTION_NAMES.get(action as usize)?.to_string();
     (metadata
         == [
             ("game".to_string(), GAME_ID.to_string()),
-            ("move".to_string(), expected),
+            ("action".to_string(), expected),
         ])
-    .then_some(direction)
+    .then_some(action)
 }
 
 fn is_valid_move_issuance(tx: &Transaction) -> bool {
     let Some(packet) = asset_packet_from_tx(tx) else {
         return false;
     };
-    if packet.groups.len() != crate::game::DIRECTIONS.len() {
+    if packet.groups.len() != crate::game::ACTION_COUNT {
         return false;
     }
     packet.groups.iter().enumerate().all(|(index, group)| {
@@ -293,12 +296,12 @@ fn is_valid_move_issuance(tx: &Transaction) -> bool {
             && group.outputs
                 == [AssetAssignment {
                     index: PLAYER_ASSET_OUTPUT_INDEX,
-                    amount: MOVE_SUPPLY,
+                    amount: crate::game::ACTION_SUPPLIES[index],
                 }]
             && group
                 .metadata
                 .as_deref()
-                .and_then(|metadata| direction_from_pairs(metadata, index as u16))
+                .and_then(|metadata| action_from_pairs(metadata, index as u16))
                 == Some(index as u8)
     })
 }
@@ -338,6 +341,9 @@ pub fn registration_player_script(
 /// Parse a native one-unit move-asset burn. Destination-script checks happen
 /// after lookup of the registered player script.
 pub fn move_burn_from_tx(tx: &Transaction) -> Option<MoveBurn> {
+    let [input] = tx.input.as_slice() else {
+        return None;
+    };
     let receipt = receipt_from_tx(tx)?;
     let packet = asset_packet_from_tx(tx)?;
     let mut player = None;
@@ -350,7 +356,7 @@ pub fn move_burn_from_tx(tx: &Transaction) -> Option<MoveBurn> {
         if group.has_control_asset
             || group.metadata.is_some()
             || group.inputs.is_empty()
-            || asset_id.group_index >= crate::game::DIRECTIONS.len() as u16
+            || asset_id.group_index >= crate::game::ACTION_COUNT as u16
             || !asset_ids.insert(asset_id)
         {
             return None;
@@ -360,7 +366,10 @@ pub fn move_burn_from_tx(tx: &Transaction) -> Option<MoveBurn> {
             None => player = Some(asset_id.txid),
             _ => {}
         }
-        if group.inputs.iter().any(|input| input.amount == 0)
+        if group
+            .inputs
+            .iter()
+            .any(|input| input.amount == 0 || tx.input.get(usize::from(input.index)).is_none())
             || group.outputs.iter().any(|output| output.amount == 0)
         {
             return None;
@@ -390,40 +399,66 @@ pub fn move_burn_from_tx(tx: &Transaction) -> Option<MoveBurn> {
     Some(MoveBurn {
         receipt,
         asset_id: burned?,
+        predecessor: input.previous_output,
         preserved_output_indexes,
     })
 }
 
 /// Validate the metadata and canonical group index of a move asset.
-pub fn direction_from_metadata(raw: &str, group_index: u16) -> Option<u8> {
+pub fn action_from_metadata(raw: &str, group_index: u16) -> Option<u8> {
     let metadata = decode_asset_metadata(raw)?;
-    direction_from_pairs(&metadata, group_index)
+    action_from_pairs(&metadata, group_index)
 }
 
-/// Return contiguous, deduplicated move streams keyed by issuance txid.
-pub fn canonical_moves(events: &[MoveEvent]) -> BTreeMap<Txid, Vec<u8>> {
+/// Select contiguous player streams, then apply the coordinator's global order.
+pub fn canonical_actions(events: &[MoveEvent]) -> Vec<MoveEvent> {
     let mut grouped: BTreeMap<Txid, Vec<&MoveEvent>> = BTreeMap::new();
     for event in events {
         grouped.entry(event.player).or_default().push(event);
     }
 
-    let mut out = BTreeMap::new();
-    for (player, mut moves) in grouped {
-        moves.sort_by_key(|event| (event.sequence, event.txid));
+    let mut out = Vec::new();
+    for (player, moves) in grouped {
         let mut expected = 0u32;
-        let mut directions = Vec::new();
-        for event in moves {
-            if event.sequence < expected {
-                continue;
-            }
-            if event.sequence > expected {
+        let mut predecessor = OutPoint {
+            txid: player,
+            vout: u32::from(PLAYER_ASSET_OUTPUT_INDEX),
+        };
+        loop {
+            let event = moves
+                .iter()
+                .copied()
+                .filter(|event| {
+                    event.sequence == expected
+                        && event.predecessor == predecessor
+                        && (event.created_at.is_some() || event.local_tentative)
+                })
+                .min_by(|left, right| match (&left.created_at, &right.created_at) {
+                    (Some(left_time), Some(right_time)) => (left_time, left.txid.to_string())
+                        .cmp(&(right_time, right.txid.to_string())),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => left.txid.to_string().cmp(&right.txid.to_string()),
+                });
+            let Some(event) = event else {
                 break;
-            }
-            directions.push(event.direction);
+            };
+            out.push(event.clone());
+            predecessor = OutPoint {
+                txid: event.txid,
+                vout: 0,
+            };
             expected = expected.saturating_add(1);
         }
-        out.insert(player, directions);
     }
+    out.sort_by(|left, right| match (&left.created_at, &right.created_at) {
+        (Some(left_time), Some(right_time)) => {
+            (left_time, left.txid.to_string()).cmp(&(right_time, right.txid.to_string()))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.txid.to_string().cmp(&right.txid.to_string()),
+    });
     out
 }
 
@@ -433,10 +468,14 @@ mod tests {
     use ark_core::asset::packet::{AssetGroup, AssetInput, AssetOutput, Packet};
     use bitcoin::hashes::Hash;
     use bitcoin::hex::DisplayHex;
-    use bitcoin::{absolute, transaction, Amount, ScriptBuf, Transaction, TxOut};
+    use bitcoin::{absolute, transaction, Amount, ScriptBuf, Transaction, TxIn, TxOut};
 
     fn txid(byte: u8) -> Txid {
         Txid::from_byte_array([byte; 32])
+    }
+
+    fn outpoint(txid: Txid, vout: u32) -> OutPoint {
+        OutPoint { txid, vout }
     }
 
     fn encode_metadata(pairs: &[(&str, &str)]) -> String {
@@ -484,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_roundtrip_and_rejection() {
+    fn receipt_serialization_and_rejection() {
         let receipt = MoveReceipt { sequence: 42 };
         assert_eq!(MoveReceipt::decode(&receipt.encode()), Some(receipt));
         assert_eq!(MoveReceipt::decode(b"AM\x01\0\0\0\0"), None);
@@ -499,14 +538,14 @@ mod tests {
     }
 
     #[test]
-    fn metadata_identifies_direction() {
-        let raw = encode_metadata(&[("game", GAME_ID), ("move", "s")]);
+    fn metadata_identifies_action() {
+        let raw = encode_metadata(&[("game", GAME_ID), ("action", "s")]);
         assert_eq!(
-            direction_from_metadata(&raw, 2),
-            Some(crate::game::DIR_DOWN)
+            action_from_metadata(&raw, 2),
+            Some(crate::game::ACTION_DOWN)
         );
-        assert_eq!(direction_from_metadata(&raw, 1), None);
-        assert_eq!(direction_from_metadata("not hex", 2), None);
+        assert_eq!(action_from_metadata(&raw, 1), None);
+        assert_eq!(action_from_metadata("not hex", 2), None);
     }
 
     #[test]
@@ -517,45 +556,113 @@ mod tests {
                 txid: txid(4),
                 player,
                 sequence: 1,
-                direction: 1,
+                action: 1,
+                predecessor: outpoint(txid(3), 0),
+                created_at: Some(2),
+                local_tentative: false,
             },
             MoveEvent {
                 txid: txid(3),
                 player,
                 sequence: 0,
-                direction: 0,
+                action: 0,
+                predecessor: outpoint(player, u32::from(PLAYER_ASSET_OUTPUT_INDEX)),
+                created_at: Some(1),
+                local_tentative: false,
             },
             MoveEvent {
                 txid: txid(2),
                 player,
                 sequence: 1,
-                direction: 2,
+                action: 2,
+                predecessor: outpoint(txid(3), 0),
+                created_at: Some(2),
+                local_tentative: false,
             },
             MoveEvent {
                 txid: txid(5),
                 player,
                 sequence: 3,
-                direction: 3,
+                action: 3,
+                predecessor: outpoint(txid(2), 0),
+                created_at: Some(3),
+                local_tentative: false,
             },
         ];
-        assert_eq!(canonical_moves(&events)[&player], vec![0, 2]);
+        assert_eq!(
+            canonical_actions(&events)
+                .iter()
+                .map(|event| event.action)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+    }
+
+    #[test]
+    fn canonical_actions_require_time_and_sort_globally() {
+        let first_player = txid(1);
+        let second_player = txid(2);
+        let events = vec![
+            MoveEvent {
+                txid: txid(8),
+                player: first_player,
+                sequence: 0,
+                action: crate::game::ACTION_SHOOT,
+                predecessor: outpoint(first_player, u32::from(PLAYER_ASSET_OUTPUT_INDEX)),
+                created_at: Some(20),
+                local_tentative: false,
+            },
+            MoveEvent {
+                txid: txid(7),
+                player: second_player,
+                sequence: 0,
+                action: crate::game::ACTION_LEFT,
+                predecessor: outpoint(second_player, u32::from(PLAYER_ASSET_OUTPUT_INDEX)),
+                created_at: Some(10),
+                local_tentative: false,
+            },
+            MoveEvent {
+                txid: txid(9),
+                player: second_player,
+                sequence: 1,
+                action: crate::game::ACTION_SHOOT,
+                predecessor: outpoint(txid(7), 0),
+                created_at: None,
+                local_tentative: false,
+            },
+            MoveEvent {
+                txid: txid(10),
+                player: second_player,
+                sequence: 2,
+                action: crate::game::ACTION_REVIVE,
+                predecessor: outpoint(txid(9), 0),
+                created_at: Some(30),
+                local_tentative: false,
+            },
+        ];
+        let accepted = canonical_actions(&events);
+        assert_eq!(
+            accepted.iter().map(|event| event.txid).collect::<Vec<_>>(),
+            vec![txid(7), txid(8)]
+        );
     }
 
     #[test]
     fn validates_canonical_registration_and_issuance() {
-        let groups = crate::game::DIRECTIONS
+        let groups = crate::game::ACTION_NAMES
             .iter()
-            .map(|direction| AssetGroup {
+            .enumerate()
+            .map(|(index, action)| AssetGroup {
                 asset_id: None,
                 control_asset: None,
                 metadata: Some(vec![
                     ("game".to_string(), GAME_ID.to_string()),
-                    ("move".to_string(), direction.to_string()),
+                    ("action".to_string(), action.to_string()),
                 ]),
                 inputs: Vec::new(),
                 outputs: vec![AssetOutput {
                     output_index: PLAYER_ASSET_OUTPUT_INDEX,
-                    amount: MOVE_SUPPLY,
+                    amount: crate::game::ACTION_SUPPLIES[index],
                 }],
             })
             .collect();
@@ -577,6 +684,16 @@ mod tests {
             registration_player_script(&tx, &game_script.to_hex_string(), 330),
             Some(player_script.to_hex_string())
         );
+        let packet = asset_packet_from_tx(&tx).unwrap();
+        assert_eq!(packet.groups.len(), crate::game::ACTION_COUNT);
+        assert_eq!(
+            packet
+                .groups
+                .iter()
+                .map(|group| group.outputs[0].amount)
+                .collect::<Vec<_>>(),
+            crate::game::ACTION_SUPPLIES
+        );
     }
 
     #[test]
@@ -592,13 +709,17 @@ mod tests {
                 metadata: None,
                 inputs: vec![AssetInput {
                     input_index: 0,
-                    amount: MOVE_SUPPLY,
+                    amount: crate::game::ACTION_SUPPLIES[0],
                 }],
                 outputs: vec![AssetOutput {
                     output_index: 0,
-                    amount: MOVE_SUPPLY - 1,
+                    amount: crate::game::ACTION_SUPPLIES[0] - 1,
                 }],
             }],
+        });
+        tx.input.push(TxIn {
+            previous_output: outpoint(txid(6), 0),
+            ..Default::default()
         });
         tx.output.push(receipt_output(7));
         assert_eq!(
@@ -606,6 +727,7 @@ mod tests {
             Some(MoveBurn {
                 receipt: MoveReceipt { sequence: 7 },
                 asset_id,
+                predecessor: outpoint(txid(6), 0),
                 preserved_output_indexes: vec![0],
             })
         );

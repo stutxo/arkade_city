@@ -5,3 +5,5 @@
 .arkade-smoke-key
 .arkade-maze-bot-key
 /.toolchain/
+/pkg-regtest/
+/.cache/

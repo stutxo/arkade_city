@@ -1,4 +1,4 @@
-//! Native headless Arkade City player and asset-preserving wallet sweep tool.
+//! Native headless Arkade Arena player and asset-preserving wallet sweep tool.
 //!
 //!   cargo run --example bot -- play
 //!   cargo run --example bot -- sweep <destination_ark_address> <key_hex>...
@@ -8,7 +8,7 @@ use arkade_city::match_::{GameApp, Phase};
 use arkade_city::{game, txbuild, ArkadeRest, Keys, ServerParams};
 
 const SERVER: &str = "https://mutinynet.arkade.sh";
-const KEY_PATH: &str = ".arkade-maze-bot-key";
+const KEY_PATH: &str = ".arkade-arena-v3-bot-key";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,7 +55,7 @@ fn load_or_create_key() -> Result<Keys> {
 
 async fn play(keys: Keys, rest: ArkadeRest, params: ServerParams) -> Result<()> {
     let mut app = GameApp::new(keys, rest, params)?;
-    let route = maze_route();
+    let route = arena_route();
     let mut route_index = 0usize;
     let mut seen_logs = 0usize;
 
@@ -77,7 +77,7 @@ async fn play(keys: Keys, rest: ArkadeRest, params: ServerParams) -> Result<()> 
                 snapshot.phase,
                 snapshot.balance,
                 snapshot.move_balances,
-                me.map(|player| (player.x, player.y, player.laps)),
+                me.map(|player| (player.x, player.y, player.hp, player.kills)),
             );
         }
         for line in snapshot.log.iter().skip(seen_logs) {
@@ -92,19 +92,13 @@ async fn play(keys: Keys, rest: ArkadeRest, params: ServerParams) -> Result<()> 
     Ok(())
 }
 
-fn maze_route() -> Vec<u8> {
-    let mut route = Vec::new();
-    let mut add = |direction, count| route.extend(std::iter::repeat_n(direction, count));
-    add(game::DIR_UP, 7);
-    add(game::DIR_RIGHT, 4);
-    add(game::DIR_DOWN, 14);
-    add(game::DIR_RIGHT, 4);
-    add(game::DIR_UP, 14);
-    add(game::DIR_RIGHT, 4);
-    add(game::DIR_DOWN, 14);
-    add(game::DIR_RIGHT, 6);
-    add(game::DIR_UP, 7);
-    route
+fn arena_route() -> Vec<u8> {
+    vec![
+        game::ACTION_UP,
+        game::ACTION_RIGHT,
+        game::ACTION_DOWN,
+        game::ACTION_LEFT,
+    ]
 }
 
 async fn sweep(

@@ -22,6 +22,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Verify production WASM
+        run: >-
+          node --input-type=module -e 'import fs from "node:fs";
+          const wasm = fs.readFileSync("pkg/arkade_city_bg.wasm");
+          if (wasm.includes(Buffer.from("http://127.0.0.1:7070")))
+          throw new Error("refusing to deploy a regtest-enabled WASM package");'
       - name: Stage static site
         run: |
           mkdir _site

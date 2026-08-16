@@ -23,7 +23,7 @@ use bitcoin::sighash::{Prevouts, SighashCache};
 use bitcoin::{Amount, Psbt, TapLeafHash, TapSighashType, TxOut, Txid, XOnlyPublicKey};
 use std::str::FromStr;
 
-pub const MOVE_SUPPLY: u64 = crate::gamelog::MOVE_SUPPLY;
+pub const ACTION_SUPPLIES: [u64; crate::game::ACTION_COUNT] = crate::game::ACTION_SUPPLIES;
 
 #[derive(Debug, Clone)]
 pub struct PendingFinalize {
@@ -89,7 +89,7 @@ pub fn server_info(params: &ServerParams) -> server::Info {
     }
 }
 
-/// Register a player and issue all four direction assets in one transaction.
+/// Register a player and issue all six arena action assets in one transaction.
 /// Output zero is the permanent game-registry entry; output one is an exact
 /// dust carrier that can be recreated by every later protocol burn.
 pub fn build_move_asset_issuance_tx(
@@ -98,12 +98,12 @@ pub fn build_move_asset_issuance_tx(
     info: &server::Info,
     game_address: ark_core::ArkAddress,
     records: &[VtxoRecord],
-) -> Result<(Psbt, Vec<Psbt>, [AssetId; 4])> {
+) -> Result<(Psbt, Vec<Psbt>, [AssetId; crate::game::ACTION_COUNT])> {
     if records.is_empty() {
-        return Err(anyhow!("cannot issue move assets without a VTXO"));
+        return Err(anyhow!("cannot issue action assets without a VTXO"));
     }
     if records.iter().any(|record| !record.assets.is_empty()) {
-        return Err(anyhow!("move asset issuance requires BTC-only inputs"));
+        return Err(anyhow!("action asset issuance requires BTC-only inputs"));
     }
 
     let vtxo = player_vtxo(keys, params)?;
@@ -127,19 +127,20 @@ pub fn build_move_asset_issuance_tx(
     let mut txs = build_offchain_transactions(&receivers, &own_address, &inputs, info)
         .map_err(|e| anyhow!("build player registration: {e}"))?;
 
-    let groups = crate::game::DIRECTIONS
+    let groups = crate::game::ACTION_NAMES
         .iter()
-        .map(|direction| ark_core::asset::packet::AssetGroup {
+        .enumerate()
+        .map(|(index, action)| ark_core::asset::packet::AssetGroup {
             asset_id: None,
             control_asset: None,
             metadata: Some(vec![
                 ("game".to_string(), crate::gamelog::GAME_ID.to_string()),
-                ("move".to_string(), direction.to_string()),
+                ("action".to_string(), action.to_string()),
             ]),
             inputs: Vec::new(),
             outputs: vec![ark_core::asset::packet::AssetOutput {
                 output_index: crate::gamelog::PLAYER_ASSET_OUTPUT_INDEX,
-                amount: MOVE_SUPPLY,
+                amount: ACTION_SUPPLIES[index],
             }],
         })
         .collect();
@@ -147,7 +148,7 @@ pub fn build_move_asset_issuance_tx(
         &mut txs.ark_tx,
         &ark_core::asset::packet::Packet { groups },
     )
-    .map_err(|e| anyhow!("attach move asset packet: {e}"))?;
+    .map_err(|e| anyhow!("attach action asset packet: {e}"))?;
 
     let txid = txs.ark_tx.unsigned_tx.compute_txid();
     let asset_ids = std::array::from_fn(|group_index| AssetId {
@@ -168,7 +169,7 @@ pub fn build_move_burn_tx(
 ) -> Result<(Psbt, Vec<Psbt>)> {
     if input.amount_sats != params.dust_sats {
         return Err(anyhow!(
-            "move asset carrier must contain exactly {} sats",
+            "action asset carrier must contain exactly {} sats",
             params.dust_sats
         ));
     }
@@ -177,7 +178,7 @@ pub fn build_move_burn_tx(
     let inputs = [vtxo_input(input, &vtxo)?];
     let mut txs =
         build_asset_burn_transactions(&own_address, &own_address, &inputs, info, asset_id, 1)
-            .map_err(|e| anyhow!("build move asset burn: {e}"))?;
+            .map_err(|e| anyhow!("build action asset burn: {e}"))?;
     let receipt = crate::gamelog::MoveReceipt { sequence }.encode();
     attach_op_return(&mut txs.ark_tx, &receipt)?;
     Ok((txs.ark_tx, txs.checkpoint_txs))
@@ -754,6 +755,7 @@ mod tests {
             is_swept: false,
             is_unrolled: false,
             expires_at: None,
+            created_at: None,
             ark_txid: None,
             spent_by: None,
         };

@@ -1,4 +1,4 @@
-//! Arkade City: one player registry and indexable asset-burn move chains.
+//! Arkade City: one player registry and indexable asset-burn action chains.
 
 pub mod arkade;
 pub mod game;
@@ -13,8 +13,10 @@ pub use keys::Keys;
 use match_::GameApp;
 use wasm_bindgen::prelude::*;
 
-pub const VERSION: &str = "2.3.1";
+pub const VERSION: &str = "3.0.0";
 pub const MUTINYNET_SERVER: &str = "https://mutinynet.arkade.sh";
+#[cfg(feature = "regtest-e2e")]
+pub const REGTEST_SERVER: &str = "http://127.0.0.1:7070";
 
 fn js_err(error: anyhow::Error) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
@@ -36,12 +38,20 @@ impl App {
         pending_journal: Option<String>,
     ) -> Result<App, JsValue> {
         console_error_panic_hook::set_once();
-        if server.trim_end_matches('/') != MUTINYNET_SERVER {
+        let server = server.trim_end_matches('/');
+        #[cfg(not(feature = "regtest-e2e"))]
+        if server != MUTINYNET_SERVER {
             return Err(JsValue::from_str(
                 "Arkade City currently supports Mutinynet only",
             ));
         }
-        let rest = ArkadeRest::new(MUTINYNET_SERVER);
+        #[cfg(feature = "regtest-e2e")]
+        if server != MUTINYNET_SERVER && server != REGTEST_SERVER {
+            return Err(JsValue::from_str(
+                "Arkade City test builds support Mutinynet and local regtest only",
+            ));
+        }
+        let rest = ArkadeRest::new(server);
         let params = rest.get_info().await.map_err(js_err)?;
         let keys = match secret_key.filter(|value| !value.trim().is_empty()) {
             Some(secret) => Keys::from_hex(secret.trim()).map_err(js_err)?,

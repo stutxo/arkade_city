@@ -29,9 +29,23 @@ fi
 
 echo "using CC_wasm32_unknown_unknown=$CC_wasm32_unknown_unknown"
 rustup target add wasm32-unknown-unknown >/dev/null 2>&1 || true
-wasm-pack build --target web --release --no-pack
-cp README.md pkg/README.md
-rm -f pkg/.gitignore
-node --input-type=module -e 'import fs from "node:fs"; const files = fs.readdirSync("pkg"); const main = files.find((file) => file.endsWith(".js") && !file.endsWith("_bg.js")); if (!main) throw new Error("generated JS entry point missing"); const stem = main.slice(0, -3); const pkg = { name: stem.replaceAll("_", "-"), type: "module", version: "0.1.0", license: "MIT", files: [`${stem}_bg.wasm`, main, `${stem}.d.ts`], main, types: `${stem}.d.ts`, sideEffects: ["./snippets/*"], private: true }; fs.writeFileSync("pkg/package.json", `${JSON.stringify(pkg, null, 2)}\n`);'
+out_dir=${WASM_OUT_DIR:-pkg}
+features=${WASM_FEATURES:-}
+if [[ "$out_dir" == "pkg" && -z "$features" ]]; then
+  : # Public Mutinynet build.
+elif [[ "$out_dir" == "pkg-regtest" && "$features" == "regtest-e2e" ]]; then
+  : # Isolated local E2E build.
+else
+  echo "error: supported WASM builds are pkg without features or pkg-regtest with regtest-e2e" >&2
+  exit 1
+fi
+wasm_args=(build --target web --release --no-pack --out-dir "$out_dir")
+if [[ -n "$features" ]]; then
+  wasm_args+=(-- --features "$features")
+fi
+wasm-pack "${wasm_args[@]}"
+cp README.md "$out_dir/README.md"
+rm -f "$out_dir/.gitignore"
+OUT_DIR="$out_dir" node --input-type=module -e 'import fs from "node:fs"; const out = process.env.OUT_DIR; const files = fs.readdirSync(out); const main = files.find((file) => file.endsWith(".js") && !file.endsWith("_bg.js")); if (!main) throw new Error("generated JS entry point missing"); const stem = main.slice(0, -3); const pkg = { name: stem.replaceAll("_", "-"), type: "module", version: "3.0.0", license: "MIT", files: [`${stem}_bg.wasm`, main, `${stem}.d.ts`], main, types: `${stem}.d.ts`, sideEffects: ["./snippets/*"], private: true }; fs.writeFileSync(`${out}/package.json`, `${JSON.stringify(pkg, null, 2)}\n`);'
 
-echo "built Arkade City: pkg/arkade_city.js + pkg/arkade_city_bg.wasm"
+echo "built Arkade City WASM in $out_dir"
