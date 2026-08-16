@@ -139,6 +139,7 @@ async function main() {
         balance: number('balance'),
         knownBalance: number('known-balance'),
         assets: [number('asset-w'), number('asset-d'), number('asset-s'), number('asset-a'), number('asset-bullet'), number('asset-life')],
+        canMintPack: Boolean(globalThis.__ARKADE_E2E_SNAPSHOT?.canMintPack),
         enterDisabled: document.getElementById('enter-game').disabled,
         pending: localStorage.getItem(${JSON.stringify(PENDING_KEY)}),
         log: document.getElementById('log').textContent,
@@ -227,6 +228,41 @@ async function main() {
         && state.lastError === 'none'
     ));
 
+    execFileSync(path.join(ROOT, 'scripts/regtest.sh'), ['fund', initial.address, '660'], {
+      cwd: ROOT,
+      stdio: 'pipe',
+      encoding: 'utf8',
+    });
+    await waitFor('funded action-pack mint', inspect, (state) => (
+      state.address === initial.address && state.balance === 1330 && state.canMintPack
+    ));
+    await execute(`
+      window.confirm = () => true;
+      document.getElementById('mint-pack').click();
+    `);
+    const mintedPack = await waitFor('new action pack mint', inspect, (state) => (
+      state.address === initial.address
+        && state.phase === 'playing'
+        && state.playerId !== replayedRegistration.playerId
+        && state.players >= replayedRegistration.players + 1
+        && state.balance === 1000
+        && JSON.stringify(state.assets) === JSON.stringify([50, 50, 50, 50, 50, 5])
+        && !state.pending
+        && !state.error
+        && state.lastError === 'none'
+    ));
+    console.log(`new action pack minted: ${mintedPack.playerId}`);
+
+    await reload();
+    const replayedMint = await waitFor('new action pack replay', inspect, (state) => (
+      state.address === initial.address
+        && state.phase === 'playing'
+        && state.playerId === mintedPack.playerId
+        && JSON.stringify(state.assets) === JSON.stringify([50, 50, 50, 50, 50, 5])
+        && !state.pending
+        && state.lastError === 'none'
+    ));
+
     const moveDirection = await execute(`
       const state = globalThis.__ARKADE_E2E_SNAPSHOT;
       const me = state.players.find((player) => player.isMe);
@@ -250,9 +286,9 @@ async function main() {
     await waitFor('move recovery and authoritative indexing', inspect, (state) => (
       state.address === initial.address
         && state.phase === 'playing'
-        && state.events >= replayedRegistration.events + 1
+        && state.events >= replayedMint.events + 1
         && state.assets[moveDirection] === 49
-        && JSON.stringify(state.position) !== JSON.stringify(replayedRegistration.position)
+        && JSON.stringify(state.position) !== JSON.stringify(replayedMint.position)
         && state.vtxos.some((vtxo) => vtxo.outpoint.startsWith(`${preparedMove.txid}:`))
         && !state.pending
         && !state.error
@@ -298,7 +334,7 @@ async function main() {
         const module = await import('./pkg-regtest/arkade_city.js');
         await module.default();
         const wallet = await module.App.init(server, key, undefined);
-        const state = await wallet.step(new Uint8Array(), false, undefined);
+        const state = await wallet.step(new Uint8Array(), false, false, undefined);
         done({
           address: state.address,
           balance: state.balance,
@@ -311,9 +347,9 @@ async function main() {
     `, [SERVER, recipient.key]);
     if (recipientState.error
         || recipientState.address !== recipient.address
-        || recipientState.balance !== 670
-        || recipientState.knownBalance !== 670
-        || JSON.stringify(recipientState.assets) !== JSON.stringify([5, 49, 50, 50, 50, 50])
+        || recipientState.balance !== 1000
+        || recipientState.knownBalance !== 1000
+        || JSON.stringify(recipientState.assets) !== JSON.stringify([5, 5, 49, 50, 50, 50, 50, 50, 50, 50, 50, 50])
         || !recipientState.outpoints.some((outpoint) => outpoint.startsWith(`${preparedSweep.txid}:`))
         || recipientState.lastError) {
       throw new Error(`recipient verification failed: ${JSON.stringify(recipientState)}`);
@@ -321,6 +357,7 @@ async function main() {
     console.log(`sweep recovered: ${preparedSweep.txid}`);
     console.log(JSON.stringify({
       registration: registered.playerId,
+      mintedPlayer: mintedPack.playerId,
       move: preparedMove.txid,
       sweep: preparedSweep.txid,
       finalSourceBalance: swept.balance,

@@ -25,7 +25,10 @@ backing sats after expiry. `cargo run --example burnaddr` recomputes the address
    reusable 330-sat player carrier.
 4. Choose an action whenever the previous carrier is indexed and available:
    W/A/S/D to move and face, Space to shoot, or R to revive.
-5. Sweep remaining sats and assets before forgetting a wallet.
+5. If movement or bullet inventory reaches zero, ensure the wallet has 660 sats
+   in BTC-only inputs and click **Mint new action pack**. This temporary flow
+   creates a new player.
+6. Sweep remaining sats and assets before forgetting a wallet.
 
 Every player starts with 3 HP, faces right, and spawns deterministically from
 the issuance txid onto an open cell. Indexed actions resolve sequentially. A
@@ -36,6 +39,12 @@ the lexicographically lowest player ID. Dead movement and shooting are
 no-ops after the asset is burned. Revive preserves kills, restores 3 HP at the
 deterministic spawn, and faces right. Players may overlap. The leaderboard sorts
 by kills descending, then player ID ascending.
+
+Action groups are immutable and cannot be refilled under the same asset IDs.
+The temporary mint button therefore publishes another canonical registration
+with fresh supplies. It resets the active player ID, deterministic position,
+HP, kills, and action history; the old pack remains recoverable in the wallet.
+A future controlled-asset shop can replace this reset flow.
 
 ## V3 Protocol
 
@@ -138,15 +147,18 @@ git submodule update --init
 ```
 
 It builds `pkg-regtest/`, funds a browser wallet, reloads after prepared
-issuance/action/sweep journals, verifies that the indexed move changes the
-authoritative local coordinates, and checks the six v3 balances and recipient
-assets. Manual helpers are available through `./scripts/regtest.sh`. The normal
-build and Pages workflow continue to package only the Mutinynet build.
+issuance/action/sweep journals, mints a second action pack with a new player ID,
+verifies that the indexed move changes the authoritative local coordinates, and
+checks both sets of v3 assets at the sweep recipient. Manual helpers are
+available through `./scripts/regtest.sh`. The normal build and Pages workflow
+continue to package only the Mutinynet build.
 
 ## Limits
 
 - Registration relinquishes 330 sats; the 330-sat carrier remains subject to
   Arkade expiry and future operator policy.
+- Each temporary action-pack mint requires 660 sats in BTC-only inputs, creates
+  a new registration, relinquishes 330 sats, and keeps 330 sats in its carrier.
 - Anyone can create a canonical registration. There is no identity, admission,
   anti-spam, or asset non-transferability mechanism.
 - Fresh clients read all registrations and registered player histories.

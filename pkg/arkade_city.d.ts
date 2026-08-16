@@ -28,7 +28,7 @@ export class App {
     /**
      * Synchronize state and execute at most one requested wallet/game action.
      */
-    step(dirs: Uint8Array, enter_game: boolean, sweep_address?: string | null): Promise<any>;
+    step(dirs: Uint8Array, enter_game: boolean, mint_pack: boolean, sweep_address?: string | null): Promise<any>;
 }
 
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
@@ -43,7 +43,7 @@ export interface InitOutput {
     readonly app_gameAddress: (a: number, b: number) => void;
     readonly app_init: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
     readonly app_snapshot: (a: number, b: number) => void;
-    readonly app_step: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
+    readonly app_step: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => number;
     readonly rustsecp256k1_v0_12_context_create: (a: number) => number;
     readonly rustsecp256k1_v0_12_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_12_default_error_callback_fn: (a: number, b: number) => void;
@@ -52,8 +52,8 @@ export interface InitOutput {
     readonly rustsecp256k1_v0_10_0_context_destroy: (a: number) => void;
     readonly rustsecp256k1_v0_10_0_default_error_callback_fn: (a: number, b: number) => void;
     readonly rustsecp256k1_v0_10_0_default_illegal_callback_fn: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_4682: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_4684: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_4720: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_4722: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

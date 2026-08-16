@@ -130,10 +130,11 @@ impl App {
         &mut self,
         dirs: Vec<u8>,
         enter_game: bool,
+        mint_pack: bool,
         sweep_address: Option<String>,
     ) -> Result<JsValue, JsValue> {
         self.inner
-            .step(&dirs, enter_game, sweep_address.as_deref())
+            .step(&dirs, enter_game, mint_pack, sweep_address.as_deref())
             .await;
         self.snapshot()
     }

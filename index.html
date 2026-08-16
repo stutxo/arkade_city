@@ -54,6 +54,10 @@
         <button id="revive" data-action="5"><strong>Revive</strong><small>R · <b id="revive-balance">0</b> lives</small></button>
       </div>
       <div id="queue-status" class="queue-status">Ready</div>
+      <div id="mint-pack-panel" class="mint-pack hidden">
+        <button id="mint-pack"><strong>Mint new action pack</strong></button>
+        <small id="mint-pack-note">Creates a new player with full moves, bullets, and lives.</small>
+      </div>
       <div class="leaderboard-wrap">
         <h3>Leaderboard</h3>
         <ol id="leaderboard"><li>No players yet</li></ol>
@@ -69,6 +73,7 @@
     <details class="drawer">
       <summary>How actions are tracked</summary>
         <p>W, D, S, A, bullets, and lives are six immutable Arkade asset groups. Every action burns exactly one matching unit and carries that player's next contiguous sequence number.</p>
+        <p>When moves or bullets run out, Mint New Action Pack creates a fresh registration. It requires 660 BTC-only sats, keeps 330 sats in the new carrier, and resets your player ID, position, HP, and kills; a future shop will replace this temporary flow.</p>
         <p>There is no game server, host, or relay. Browsers validate every burn for inventory continuity, then replay all indexed actions sequentially in global <code>(createdAt, txid)</code> order. Later historical indexer data can change that replay.</p>
         <p>Your selected action is previewed immediately, but authoritative position, HP, and kills change only after the indexer supplies its timestamp. The preview remains visible while indexing catches up.</p>
     </details>
@@ -133,6 +138,6 @@
     </details>
   </main>
 
-  <script type="module" src="web.js?v=3.0.0-fast2"></script>
+  <script type="module" src="web.js?v=3.0.0-fast3"></script>
 </body>
 </html>

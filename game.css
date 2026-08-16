@@ -48,6 +48,9 @@ canvas { display: block; width: min(100%, 620px); aspect-ratio: 1; margin: auto;
 .combat-controls { display: flex; justify-content: center; gap: 10px; margin-top: 10px; }
 .combat-controls button { min-width: 150px; display: grid; gap: 2px; }
 .combat-controls small { font-size: 11px; font-weight: normal; }
+.mint-pack { display: grid; justify-items: center; gap: 5px; max-width: 620px; margin: 12px auto 0; padding: 12px; border: 1px solid #9f2929; background: #fff8f6; text-align: center; }
+.mint-pack button { min-width: 220px; border-color: #9f2929; color: #7c2020; }
+.mint-pack small { max-width: 520px; color: #6b4b45; line-height: 1.35; }
 .leaderboard-wrap { max-width: 620px; margin: 16px auto 0; border-top: 1px solid #ddd; }
 .leaderboard { margin-bottom: 0; }
 #leaderboard { display: grid; gap: 4px; margin: 0; padding-left: 28px; font: 12px ui-monospace, monospace; }

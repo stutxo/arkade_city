@@ -130,6 +130,7 @@ pub struct GameApp {
 
     pub phase: Phase,
     move_assets: Option<[AssetId; crate::game::ACTION_COUNT]>,
+    move_pack_created_at: Option<i64>,
     move_balances: [u64; crate::game::ACTION_COUNT],
     carrier_available: bool,
     issuance_visible: bool,
@@ -199,6 +200,7 @@ impl GameApp {
             game_script,
             phase: Phase::FundWallet,
             move_assets: None,
+            move_pack_created_at: None,
             move_balances: [0; crate::game::ACTION_COUNT],
             carrier_available: false,
             issuance_visible: false,
@@ -307,6 +309,7 @@ impl GameApp {
             }
             self.phase = Phase::Issuing;
             self.move_assets = Some(*asset_ids);
+            self.move_pack_created_at = Some(i64::MAX);
             self.move_balances = txbuild::ACTION_SUPPLIES;
             self.next_sequence = 0;
             self.registered_players.insert(txid, self.player_script());
@@ -354,7 +357,13 @@ impl GameApp {
 
     /// Browser tick: synchronize wallet and game state concurrently while idle,
     /// but serialize wallet mutations and their recovery.
-    pub async fn step(&mut self, dirs: &[u8], enter_game: bool, sweep_address: Option<&str>) {
+    pub async fn step(
+        &mut self,
+        dirs: &[u8],
+        enter_game: bool,
+        mint_pack: bool,
+        sweep_address: Option<&str>,
+    ) {
         self.queue_inputs(dirs);
         if self.has_fresh_prepared_action() {
             self.resume_pending().await;
@@ -362,6 +371,7 @@ impl GameApp {
         }
 
         let action_tick = enter_game
+            || mint_pack
             || sweep_address.is_some()
             || self.pending_action.is_some()
             || !self.pending_dirs.is_empty();
@@ -428,13 +438,11 @@ impl GameApp {
             },
             None => false,
         };
-        if self.move_assets.is_none() {
-            match self.discover_move_assets(&spendable).await {
-                Ok(()) => {}
-                Err(err) => {
-                    self.report_error("asset recovery", &err);
-                    return;
-                }
+        match self.discover_move_assets(&spendable).await {
+            Ok(()) => {}
+            Err(err) => {
+                self.report_error("asset recovery", &err);
+                return;
             }
         }
         self.refresh_wallet_state(&spendable);
@@ -482,9 +490,23 @@ impl GameApp {
 
         if self.move_assets.is_none() {
             if enter_game && self.funding_ready && !self.sending {
-                if let Err(err) = self.issue_move_assets(&spendable).await {
+                if let Err(err) = self.issue_move_assets(&spendable, false).await {
                     self.handle_send_error("issuance", &err);
                 }
+            }
+            return;
+        }
+
+        if mint_pack {
+            if !self.can_mint_pack() {
+                self.log_line(format!(
+                    "mint requires {} sats in BTC-only inputs",
+                    self.required_funding()
+                ));
+                return;
+            }
+            if let Err(err) = self.issue_move_assets(&spendable, true).await {
+                self.handle_send_error("action pack mint", &err);
             }
             return;
         }
@@ -542,29 +564,54 @@ impl GameApp {
     }
 
     async fn discover_move_assets(&mut self, spendable: &[VtxoRecord]) -> Result<()> {
-        let mut candidates = HashSet::new();
+        let mut candidates: HashMap<Txid, i64> = HashMap::new();
         for record in spendable {
             for (id, amount) in &record.assets {
                 let Some(asset_id) = txbuild::parse_asset_id_pub(id) else {
                     continue;
                 };
                 if *amount > 0 && asset_id.group_index < crate::game::ACTION_COUNT as u16 {
-                    candidates.insert(asset_id.txid);
+                    let created_at = record.created_at.unwrap_or(i64::MIN);
+                    candidates
+                        .entry(asset_id.txid)
+                        .and_modify(|seen_at| *seen_at = (*seen_at).max(created_at))
+                        .or_insert(created_at);
                 }
             }
         }
+        if let Some(player) = self.player_id() {
+            if let Some(created_at) = candidates.get(&player) {
+                self.move_pack_created_at = Some(
+                    self.move_pack_created_at
+                        .unwrap_or(i64::MIN)
+                        .max(*created_at),
+                );
+            }
+        }
+        let mut candidates: Vec<_> = candidates.into_iter().collect();
+        candidates.sort_by(|left, right| {
+            (right.1, right.0.to_string()).cmp(&(left.1, left.0.to_string()))
+        });
         let own_script = self.player_script();
-        for txid in candidates {
+        for (txid, created_at) in candidates {
+            if self.player_id() == Some(txid)
+                || (self.move_assets.is_some()
+                    && created_at <= self.move_pack_created_at.unwrap_or(i64::MIN))
+            {
+                continue;
+            }
             if self.issuance_player_script(txid).await?.as_deref() == Some(own_script.as_str()) {
                 let asset_ids = std::array::from_fn(|group_index| AssetId {
                     txid,
                     group_index: group_index as u16,
                 });
                 self.move_assets = Some(asset_ids);
-                self.log_line(format!(
-                    "recovered action asset issuance {}",
-                    short_txid(&txid)
-                ));
+                self.move_pack_created_at = Some(created_at);
+                self.move_balances = [0; crate::game::ACTION_COUNT];
+                self.carrier_available = false;
+                self.issuance_visible = false;
+                self.next_sequence = 0;
+                self.log_line(format!("selected newest action pack {}", short_txid(&txid)));
                 break;
             }
         }
@@ -596,7 +643,11 @@ impl GameApp {
                 .any(|record| record.script.eq_ignore_ascii_case(script))
     }
 
-    async fn issue_move_assets(&mut self, spendable: &[VtxoRecord]) -> Result<()> {
+    async fn issue_move_assets(
+        &mut self,
+        spendable: &[VtxoRecord],
+        resets_player: bool,
+    ) -> Result<()> {
         let required = self.required_funding();
         let selected = self.registration_inputs(spendable).ok_or_else(|| {
             anyhow!(
@@ -626,11 +677,19 @@ impl GameApp {
         let (submission, asset_ids) = result?;
         let txid = submission.txid;
         self.move_assets = Some(asset_ids);
+        self.move_pack_created_at = Some(i64::MAX);
         self.registered_players.insert(txid, self.player_script());
         self.move_balances = txbuild::ACTION_SUPPLIES;
+        self.carrier_available = false;
+        self.issuance_visible = false;
         self.next_sequence = 0;
         self.log_line(format!(
-            "issuance {} prepared; persisting before submission",
+            "{} {} prepared; persisting before submission",
+            if resets_player {
+                "new action pack"
+            } else {
+                "issuance"
+            },
             short_txid(&txid)
         ));
         self.pending_action = Some(PendingAction::UnknownIssuance {
@@ -889,6 +948,14 @@ impl GameApp {
             && self.pending_dirs.is_empty()
             && self.local_tentative_action().is_none()
             && self.carrier_available
+    }
+
+    fn can_mint_pack(&self) -> bool {
+        self.move_assets.is_some()
+            && self.funding_ready
+            && !self.sending
+            && self.pending_action.is_none()
+            && self.pending_dirs.is_empty()
     }
 
     fn projected_action(&self) -> Option<u8> {
@@ -1699,6 +1766,7 @@ impl GameApp {
             funding_ready: self.funding_ready,
             registration_cost: self.params.dust_sats,
             reusable_carrier: self.params.dust_sats,
+            mint_pack_funding: self.required_funding(),
             move_balances: self.move_balances,
             sending: self.sending,
             pending: self.pending_action.is_some(),
@@ -1713,6 +1781,7 @@ impl GameApp {
             walls: crate::game::walls(),
             houses: crate::game::houses(),
             can_act: self.can_act(),
+            can_mint_pack: self.can_mint_pack(),
             projected_action: self.projected_action(),
             shot_traces: arena.shot_traces,
             events: self.events.len() as u32,
@@ -1772,6 +1841,7 @@ pub struct Snapshot {
     pub funding_ready: bool,
     pub registration_cost: u64,
     pub reusable_carrier: u64,
+    pub mint_pack_funding: u64,
     pub move_balances: [u64; crate::game::ACTION_COUNT],
     pub sending: bool,
     pub pending: bool,
@@ -1786,6 +1856,7 @@ pub struct Snapshot {
     pub walls: Vec<[i32; 2]>,
     pub houses: Vec<[i32; 2]>,
     pub can_act: bool,
+    pub can_mint_pack: bool,
     pub projected_action: Option<u8>,
     pub shot_traces: Vec<crate::game::ShotTrace>,
     pub events: u32,

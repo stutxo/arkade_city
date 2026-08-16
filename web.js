@@ -2,7 +2,7 @@ const query = new URLSearchParams(location.search);
 const REGTEST_MODE = ['127.0.0.1', 'localhost'].includes(location.hostname)
   && query.get('network') === 'regtest';
 const E2E_MODE = REGTEST_MODE && query.get('e2e') === '1';
-const ASSET_REVISION = '3.0.0-fast2';
+const ASSET_REVISION = '3.0.0-fast3';
 const packageUrl = REGTEST_MODE
   ? `./pkg-regtest/arkade_city.js?v=${ASSET_REVISION}`
   : `./pkg/arkade_city.js?v=${ASSET_REVISION}`;
@@ -25,6 +25,7 @@ let app = null;
 let snapshot = null;
 let inputQueue = [];
 let pendingEnterGame = false;
+let pendingMintPack = false;
 let pendingSweep = null;
 let driverGeneration = 0;
 let currentServer = '';
@@ -114,6 +115,7 @@ async function connectApp() {
   const generation = ++driverGeneration;
   app = null;
   snapshot = null;
+  pendingMintPack = false;
   hide('app');
   hide('boot-error');
 
@@ -173,6 +175,17 @@ function bindStaticActions() {
     wakeDriver();
   });
 
+  $('mint-pack').addEventListener('click', () => {
+    if (!snapshot?.canMintPack || pendingMintPack) {
+      return showError(`Minting a new pack requires ${snapshot?.mintPackFunding?.toLocaleString() || '660'} sats in BTC-only inputs.`);
+    }
+    if (!confirm('Mint a fresh action pack? This creates a new player ID and resets your position, HP, kills, and action history.')) return;
+    pendingMintPack = true;
+    text('wallet-action', 'action pack mint queued');
+    $('mint-pack').disabled = true;
+    wakeDriver();
+  });
+
   $('import-wallet').addEventListener('click', () => {
     try {
       const recovery = parseImportedSecret($('import-key').value);
@@ -224,7 +237,8 @@ function bindStaticActions() {
     button.addEventListener('click', () => queueMove(Number(button.dataset.action)));
   }
   addEventListener('beforeunload', (event) => {
-    if (!E2E_MODE && (snapshot?.pending || snapshot?.sending || snapshot?.queued || inputQueue.length)) {
+    if (!E2E_MODE && (snapshot?.pending || snapshot?.sending || snapshot?.queued
+        || inputQueue.length || pendingMintPack)) {
       event.preventDefault();
       event.returnValue = '';
     }
@@ -294,15 +308,18 @@ async function driver(instance, generation) {
       && !wasPending;
     const directions = canSendMoves ? inputQueue : [];
     const enterGame = pendingEnterGame;
+    const mintPack = pendingMintPack;
     const sweep = pendingSweep;
     if (canSendMoves) inputQueue = [];
     inFlightDirections = directions;
     pendingEnterGame = false;
+    pendingMintPack = false;
     pendingSweep = null;
     try {
       const nextSnapshot = await instance.step(
         new Uint8Array(directions),
         enterGame,
+        mintPack,
         sweep || undefined,
       );
       let rawPending;
@@ -335,6 +352,7 @@ async function driver(instance, generation) {
     const continueImmediately = (!wasPending && snapshot?.pending)
       || (wasPending && !snapshot?.pending && queued > 0)
       || pendingEnterGame
+      || pendingMintPack
       || pendingSweep;
     if (!continueImmediately) {
       await waitForDriver(Math.max(0, POLL_MS - (performance.now() - tickStarted)));
@@ -396,6 +414,12 @@ function applySnapshot(state) {
   $('ammo-stock').classList.toggle('depleted', Boolean(state.playerId) && balances[4] === 0);
   text('shoot-balance', balances[4]);
   text('revive-balance', balances[5]);
+  const packDepleted = Boolean(state.playerId) && (movesRemaining === 0 || balances[4] === 0);
+  packDepleted ? show('mint-pack-panel') : hide('mint-pack-panel');
+  $('mint-pack').disabled = !state.canMintPack || pendingMintPack;
+  text('mint-pack-note', state.canMintPack
+    ? `Uses ${state.mintPackFunding.toLocaleString()} BTC-only sats: 330 sats register the new player and 330 sats remain in its carrier.`
+    : `Requires ${state.mintPackFunding.toLocaleString()} sats in BTC-only inputs. The mint resets player ID, position, HP, kills, and history.`);
   const me = state.players.find((player) => player.isMe);
   text('local-hp', me?.hp ?? '-');
   text('max-hp', state.maxHp);

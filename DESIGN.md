@@ -32,6 +32,13 @@ to output 1. The issuance txid is the player ID. Registration validation also
 requires one registry output at index 0, one P2TR player carrier at index 1,
 exact dust values, no registry assets, and no unrelated receipt payload.
 
+Because these groups have no control asset, their IDs cannot be reissued. The
+temporary Mint New Action Pack flow therefore publishes another complete
+registration from 660 sats of BTC-only inputs. Its issuance txid becomes the
+active player ID and resets position, HP, kills, and sequence; the prior player
+and its remaining immutable assets stay discoverable. Fresh wallet recovery
+selects the newest spendable pack by indexed carrier creation time.
+
 ## Actions
 
 All six actions use the same native asset-burn transaction shape:
